@@ -12,6 +12,7 @@
   <link rel="stylesheet" href="/style.css">
   <script src="/vendor/nacl.js" defer></script>
   <script src="/vendor/qrcode.js" defer></script>
+  <script src="/pake.js" defer></script>
   <script src="/app.js" defer></script>
 </head>
 <body>
@@ -104,6 +105,17 @@
         <span class="pair-go" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 12h14m-6-6l6 6-6 6"/></svg></span>
       </button>
 
+      <form class="code-join" id="codeJoin" autocomplete="off">
+        <label for="codeInput">Have a pairing code?</label>
+        <div class="code-field">
+          <input id="codeInput" inputmode="numeric" placeholder="7-291-735" maxlength="12" spellcheck="false" aria-describedby="codeHint">
+          <button class="code-go" id="codeGo" type="submit" disabled aria-label="Join with code">
+            <svg viewBox="0 0 24 24"><path d="M5 12h14m-6-6l6 6-6 6"/></svg>
+          </button>
+        </div>
+        <small id="codeHint">Shown on the other computer under <b>Pair a device → Code</b>.</small>
+      </form>
+
       <div class="shares hidden" id="activeWrap">
         <h3>Active shares <small>this tab only</small></h3>
         <ul id="activeList"></ul>
@@ -173,6 +185,12 @@
 
         <div class="invite" id="roomInvite">
           <div class="invite-inner">
+            <div class="seg small" role="tablist" id="inviteSeg" data-mode="qr">
+              <span class="seg-pill" aria-hidden="true"></span>
+              <button role="tab" class="seg-btn active" data-invite="qr" aria-selected="true">QR code</button>
+              <button role="tab" class="seg-btn" data-invite="code" aria-selected="false">Code</button>
+            </div>
+            <div class="invite-pane" data-pane="qr">
             <div class="qr-wrap small">
               <canvas id="roomQr" width="480" height="480" aria-label="QR code to join this session"></canvas>
               <div class="qr-scan" aria-hidden="true"></div>
@@ -183,6 +201,13 @@
               <button class="icon-btn" id="roomCopy" title="Copy session link">
                 <svg viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="3"/><path d="M16 8V6a2 2 0 00-2-2H6a2 2 0 00-2 2v8a2 2 0 002 2h2"/></svg>
               </button>
+            </div>
+            </div>
+            <div class="invite-pane hidden" data-pane="code">
+              <div class="pair-code" id="pairCode" aria-live="polite"></div>
+              <div class="code-timer"><i id="codeTimer"></i></div>
+              <p class="sub small" id="codeStatus">On the other computer, open this page's address and type the code under “Have a pairing code?”.</p>
+              <p class="code-note">Single-use · expires in 5 minutes · never sent to the server</p>
             </div>
           </div>
         </div>
@@ -257,6 +282,7 @@
       <li><b>Unlisted.</b> No one can browse shares. Each has a random 128‑bit address that can't be guessed.</li>
       <li><b>Tamper‑proof.</b> Every block is authenticated; any modification is detected and rejected.</li>
       <li><b>Live sessions too.</b> Paired devices share a key from the QR code. Messages, device names and files are sealed with it — the host only relays noise.</li>
+      <li><b>Pairing codes stay secret.</b> The six digits never leave your devices — a PAKE turns them into a strong key, and a wrong guess voids the code.</li>
       <li><b>Zero third parties.</b> No CDNs, fonts, analytics or cookies. Everything is served from your machine.</li>
     </ul>
     <button class="ghost" id="privacyClose">Got it</button>

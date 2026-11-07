@@ -1204,6 +1204,7 @@
       ? 'Connecting…'
       : n ? `${n + 1} devices connected · encrypted` : 'Waiting for another device to join…';
     $('#roomInvite').classList.toggle('collapsed', n > 0 && !room.inviteOpen);
+    if (typeof syncHosting === 'function') syncHosting();
     $('#roomView').classList.toggle('paired', n > 0);
 
     const wrap = $('#peers');
@@ -1227,6 +1228,7 @@
     if (room.closed) return;
     room.closed = true;
     room.abort?.abort();
+    stopHosting();
     for (const s of room.shares) if (!s.gone) {
       api(`/api/s/${s.id}`, { method: 'DELETE', headers: { 'X-Owner-Token': s.ownerToken } }).catch(() => {});
       markGone(s, 'Session ended');
@@ -1375,6 +1377,160 @@
       li.classList.add('failed');
     }
   }
+
+  // ============================================================ PAIRING CODES
+  // Computer-to-computer pairing without a camera: one side shows a code like "7-291-735",
+  // the other types it. "7" is a public mailbox slot; the six digits are a password for a
+  // CPace PAKE (see pake.js). Both sides derive a strong key from the handshake and the
+  // session key is sent across sealed with it. The digits never leave either device, a
+  // passive observer can't brute-force them offline, and each code allows a single attempt.
+  const pairing = { abort: null, mode: 'qr' };
+
+  function randomDigits(n) {
+    let out = '';
+    while (out.length < n) { const b = nacl.randomBytes(1)[0]; if (b < 250) out += b % 10; } // unbiased
+    return out;
+  }
+
+  async function pairSend(slot, token, obj, signal) {
+    await api(`/api/pair/${slot}/send`, {
+      method: 'POST', signal, headers: { 'X-Pair-Token': token, 'Content-Type': 'text/plain' }, body: JSON.stringify(obj),
+    });
+  }
+  async function pairRecv(slot, token, signal) {
+    for (;;) { // long-poll until the other side says something
+      const res = await api(`/api/pair/${slot}/recv`, { headers: { 'X-Pair-Token': token }, signal });
+      if (res.status === 200) return JSON.parse(await res.text());
+    }
+  }
+
+  function showCode(code, ttl) {
+    const box = $('#pairCode');
+    box.textContent = '';
+    [...code].forEach((ch, i) => box.append(h('span', { class: ch === '-' ? 'sep' : 'dg', style: `--i:${i}` }, ch === '-' ? '' : ch)));
+    box.setAttribute('aria-label', `Pairing code ${code.split('').join(' ')}`);
+    const bar = $('#codeTimer');
+    bar.style.transition = 'none';
+    bar.style.width = '100%';
+    void bar.offsetWidth;
+    bar.style.transition = `width ${ttl}ms linear`;
+    bar.style.width = '0%';
+    const where = (shareOrigins()[originIdx]?.origin || location.origin).replace(/^https?:\/\//, '');
+    $('#codeStatus').textContent = `On the other computer, open ${where} and type this code under “Have a pairing code?”.`;
+  }
+
+  function stopHosting() { pairing.abort?.abort(); pairing.abort = null; }
+
+  async function hostPairing() {
+    stopHosting();
+    const ctl = new AbortController();
+    pairing.abort = ctl;
+    const { signal } = ctl;
+    $('#pairCode').textContent = '';
+    while (!signal.aborted && !room.closed) {
+      let slot = null;
+      let token = null;
+      try {
+        const pass = randomDigits(6);
+        const sid = nacl.randomBytes(16);
+        const st = CPace.start(pass, sid);
+        const r = await (await api('/api/pair', { method: 'POST', signal })).json();
+        ({ slot, token } = r);
+        showCode(`${slot}-${pass.slice(0, 3)}-${pass.slice(3)}`, r.ttl);
+        await pairSend(slot, token, { sid: b64u.enc(sid), Y: b64u.enc(st.Y) }, signal);
+        const m = await pairRecv(slot, token, signal); // the other computer's answer
+        let keys = null;
+        try {
+          keys = CPace.finish(st, sid, b64u.dec(m.Y), true);
+          if (!nacl.verify(keys.guestTag, b64u.dec(m.tag || ''))) keys = null;
+        } catch { keys = null; }
+        if (!keys) {
+          await pairSend(slot, token, { fail: true }, signal).catch(() => {});
+          toast('A wrong code was entered — that code is now void. Here’s a fresh one.', 'err');
+          continue;
+        }
+        const nonce = nacl.randomBytes(NONCE);
+        const sealed = nacl.secretbox(new TextEncoder().encode(JSON.stringify({ room: room.id, key: b64u.enc(room.key) })), nonce, keys.key);
+        const box = new Uint8Array(NONCE + sealed.length);
+        box.set(nonce);
+        box.set(sealed, NONCE);
+        await pairSend(slot, token, { tag: b64u.enc(keys.hostTag), box: b64u.enc(box) }, signal);
+        toast('Code accepted — connecting the other computer…', 'ok');
+        slot = null; // used up; the guest closes the mailbox
+      } catch (err) {
+        if (signal.aborted) break;
+        if (err.status !== 404 && err.status !== 410) await sleep(1500); // expired codes just roll over
+      } finally {
+        if (slot && signal.aborted) api(`/api/pair/${slot}`, { method: 'DELETE', headers: { 'X-Pair-Token': token } }).catch(() => {});
+      }
+    }
+  }
+
+  $('#inviteSeg').addEventListener('click', (e) => {
+    const btn = e.target.closest('.seg-btn');
+    if (!btn) return;
+    pairing.mode = btn.dataset.invite;
+    $('#inviteSeg').dataset.mode = pairing.mode;
+    $$('#inviteSeg .seg-btn').forEach((b) => { b.classList.toggle('active', b === btn); b.setAttribute('aria-selected', b === btn); });
+    $$('.invite-pane').forEach((p) => p.classList.toggle('hidden', p.dataset.pane !== pairing.mode));
+    syncHosting();
+  });
+
+  // Only run a pairing code while the Code tab is actually visible.
+  function syncHosting() {
+    const visible = !room.closed && pairing.mode === 'code' && !$('#roomInvite').classList.contains('collapsed');
+    if (visible && !pairing.abort) hostPairing();
+    else if (!visible && pairing.abort) stopHosting();
+  }
+
+  // ---- joining with a code (home page)
+  const codeForm = $('#codeJoin');
+  const codeInput = $('#codeInput');
+  const codeDigits = () => codeInput.value.replace(/\D/g, '');
+  const CODE_HINT = 'Shown on the other computer under <b>Pair a device → Code</b>.';
+  codeInput.addEventListener('input', () => {
+    $('#codeGo').disabled = codeDigits().length < 7;
+    codeForm.classList.remove('bad');
+  });
+  codeForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const d = codeDigits();
+    if (d.length < 7 || codeForm.classList.contains('busy')) return;
+    if (typeof CPace === 'undefined' || typeof nacl === 'undefined') return toast('Encryption library failed to load', 'err');
+    const slot = String(parseInt(d.slice(0, -6), 10));
+    const pass = d.slice(-6);
+    const hint = $('#codeHint');
+    codeForm.classList.add('busy');
+    codeForm.classList.remove('bad');
+    hint.textContent = 'Connecting securely…';
+    let token = null;
+    try {
+      ({ token } = await (await api(`/api/pair/${slot}/claim`, { method: 'POST' })).json());
+      const m1 = await pairRecv(slot, token);
+      const sid = b64u.dec(m1.sid);
+      const st = CPace.start(pass, sid);
+      const keys = CPace.finish(st, sid, b64u.dec(m1.Y), false);
+      await pairSend(slot, token, { Y: b64u.enc(st.Y), tag: b64u.enc(keys.guestTag) });
+      const m2 = await pairRecv(slot, token);
+      if (m2.fail || !nacl.verify(keys.hostTag, b64u.dec(m2.tag || ''))) throw new Error('That code didn’t match. It’s now void — ask for a new one.');
+      const box = b64u.dec(m2.box);
+      const plain = nacl.secretbox.open(box.subarray(NONCE), box.subarray(0, NONCE), keys.key);
+      if (!plain) throw new Error('Pairing failed — please try again');
+      const { room: roomId, key } = JSON.parse(new TextDecoder().decode(plain));
+      codeInput.value = '';
+      $('#codeGo').disabled = true;
+      hint.innerHTML = CODE_HINT;
+      enterRoom(roomId, b64u.dec(key));
+    } catch (err) {
+      codeForm.classList.remove('bad');
+      void codeForm.offsetWidth;
+      codeForm.classList.add('bad');
+      hint.textContent = err.message;
+    } finally {
+      if (token) api(`/api/pair/${slot}`, { method: 'DELETE', headers: { 'X-Pair-Token': token } }).catch(() => {});
+      codeForm.classList.remove('busy');
+    }
+  });
 
   // ---- composer
   const roomText = $('#roomText');

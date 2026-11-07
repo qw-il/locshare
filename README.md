@@ -28,6 +28,16 @@ Click **Pair a device**, then scan the QR code on a phone, tablet or laptop on t
   - Larger batches stream straight to disk when you tap save.
 - **When it ends.** Leaving a session, or closing every tab in it, ends it. Any transfers in progress are revoked and wiped.
 
+### Pairing two computers with a code
+
+Computers usually can't scan a QR code, so a session can also show a short code instead. Open **Pair a device**, switch to the **Code** tab, and the code appears (for example `29-816-430`). On the other computer, open the LocShare address, type the code under **Have a pairing code?**, and the two are connected.
+
+- The first number is just a public "slot" that tells the server which pairing is meant. The six digits after it are the secret, and they never leave either computer.
+- The computers run [CPace](https://datatracker.ietf.org/doc/draft-irtf-cfrg-cpace/), a password-authenticated key exchange (PAKE) built on X25519. Both turn the six digits into the same strong key. The session key is then sent across sealed with that key.
+- Someone watching or relaying the exchange, including the server, learns nothing they could use to guess the code offline.
+- Each code allows exactly one attempt. A wrong guess voids it, the host is told, and a fresh code appears. A guesser therefore has a one-in-a-million chance per code shown.
+- Codes expire after 5 minutes. A used slot isn't reissued for 10 minutes, so a stale code can't collide with a new one.
+
 ## No file size limit
 
 There are two ways a share can travel. LocShare picks one automatically:

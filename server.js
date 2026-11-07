@@ -132,6 +132,69 @@ function roomBroadcast(room, line, except, only) {
   }
 }
 
+// ---------------------------------------------------------------- pairing codes
+// A short-lived two-party mailbox for the CPace handshake behind codes like "7-291-735".
+// The leading number is just a public slot; the six secret digits never reach the server —
+// only public PAKE values and a box sealed with the resulting key pass through here.
+const PAIR_TTL_MS = 5 * 60 * 1000;
+const PAIR_WAIT_MS = 25 * 1000;
+const PAIR_MAX_MSG = 8 * 1024;
+
+/** @type {Map<string, any>} */
+const pairs = new Map();
+
+// Freed slots rest for a while, so a stale code typed late can't land on (and burn) a fresh one.
+const SLOT_COOLDOWN_MS = 10 * 60 * 1000;
+const coolingSlots = new Map(); // slot -> time it becomes reusable
+
+function createPair() {
+  const now = Date.now();
+  for (const [sl, t] of coolingSlots) if (t <= now) coolingSlots.delete(sl);
+  const free = (n) => !pairs.has(String(n)) && !coolingSlots.has(String(n));
+  let slot = null;
+  // Short random slots first (1–99), widening only if the network is unusually busy.
+  for (const max of [99, 999, 9999]) {
+    for (let tries = 0; tries < 40 && !slot; tries++) {
+      const n = 1 + crypto.randomInt(max);
+      if (free(n)) slot = String(n);
+    }
+    if (slot) break;
+  }
+  if (!slot) return null;
+  const pair = {
+    slot,
+    tokens: { host: newId(18), guest: null },
+    queue: { host: [], guest: [] },
+    waiter: { host: null, guest: null },
+    timer: null,
+  };
+  pair.timer = setTimeout(() => closePair(pair), PAIR_TTL_MS);
+  pairs.set(slot, pair);
+  return pair;
+}
+
+function closePair(pair) {
+  clearTimeout(pair.timer);
+  for (const role of ['host', 'guest']) {
+    const w = pair.waiter[role];
+    if (w) { clearTimeout(w.timer); if (!w.res.headersSent) fail(w.res, 410, 'Pairing code expired'); }
+  }
+  if (pairs.get(pair.slot) === pair) {
+    pairs.delete(pair.slot);
+    coolingSlots.set(pair.slot, Date.now() + SLOT_COOLDOWN_MS);
+  }
+}
+
+function pairRole(req, pair) {
+  const t = req.headers['x-pair-token'];
+  if (typeof t !== 'string') return null;
+  for (const role of ['host', 'guest']) {
+    const want = pair.tokens[role];
+    if (want && t.length === want.length && crypto.timingSafeEqual(Buffer.from(t), Buffer.from(want))) return role;
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------- http helpers
 const SECURITY_HEADERS = {
   'Content-Security-Policy': [
@@ -297,6 +360,53 @@ async function handle(req, res) {
       return fail(res, 405, 'Method not allowed');
     }
 
+    if (p === '/api/pair' && m === 'POST') {
+      const pair = createPair();
+      if (!pair) return fail(res, 503, 'Too many pairing codes in use — try again shortly');
+      return send(res, 201, { slot: pair.slot, token: pair.tokens.host, ttl: PAIR_TTL_MS });
+    }
+
+    const pm = p.match(/^\/api\/pair\/(\d{1,4})(?:\/(claim|send|recv))?$/);
+    if (pm) {
+      const pair = pairs.get(pm[1]);
+      if (!pair) return fail(res, 404, 'That code doesn’t exist or has expired');
+      const action = pm[2];
+
+      // One guest per code: a second claim (e.g. someone guessing) is refused outright.
+      if (action === 'claim' && m === 'POST') {
+        if (pair.tokens.guest) return fail(res, 409, 'That code has already been used — ask for a new one');
+        pair.tokens.guest = newId(18);
+        return send(res, 200, { token: pair.tokens.guest });
+      }
+
+      const role = pairRole(req, pair);
+      if (!role) return fail(res, 403, 'Forbidden');
+      const other = role === 'host' ? 'guest' : 'host';
+
+      if (action === 'send' && m === 'POST') {
+        const body = (await readBody(req, PAIR_MAX_MSG)).toString();
+        const w = pair.waiter[other];
+        if (w) { pair.waiter[other] = null; clearTimeout(w.timer); send(w.res, 200, body); }
+        else pair.queue[other].push(body);
+        return send(res, 200, { ok: true });
+      }
+
+      if (action === 'recv' && m === 'GET') {
+        if (pair.queue[role].length) return send(res, 200, pair.queue[role].shift());
+        if (pair.waiter[role]) { clearTimeout(pair.waiter[role].timer); fail(pair.waiter[role].res, 409, 'Superseded'); }
+        const w = { res, timer: setTimeout(() => { if (pair.waiter[role] === w) pair.waiter[role] = null; send(res, 204, ''); }, PAIR_WAIT_MS) };
+        pair.waiter[role] = w;
+        res.on('close', () => { if (pair.waiter[role] === w) { clearTimeout(w.timer); pair.waiter[role] = null; } });
+        return;
+      }
+
+      if (!action && m === 'DELETE') {
+        closePair(pair);
+        return send(res, 200, { ok: true });
+      }
+      return fail(res, 405, 'Method not allowed');
+    }
+
     const sm = p.match(/^\/api\/s\/([A-Za-z0-9_-]{22})(?:\/(c|m|a|w)(?:\/(\d{1,12}))?)?$/);
     if (sm) {
       const share = shares.get(sm[1]);
@@ -454,6 +564,7 @@ server.listen(PORT, HOST, () => {
 });
 
 function shutdown() {
+  for (const pr of [...pairs.values()]) closePair(pr);
   for (const r of [...rooms.values()]) closeRoom(r);
   for (const s of [...shares.values()]) destroyShare(s);
   process.exit(0);
