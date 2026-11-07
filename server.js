@@ -1,0 +1,320 @@
+#!/usr/bin/env node
+/*
+ * LocShare — private file sharing over your local network.
+ *
+ * Privacy model
+ * -------------
+ *  - Files are encrypted in the sender's browser (XSalsa20-Poly1305) before upload.
+ *    The key lives only in the link's #fragment, which browsers never send to servers.
+ *  - File names, types, sizes and notes are encrypted too (inside the manifest).
+ *  - Content is padded to fixed-size chunks, so the server only learns a rounded size.
+ *  - Everything is kept in RAM only. Nothing is ever written to disk, and nothing is logged.
+ *  - Shares are unlisted (128-bit random IDs), expire automatically and can be revoked
+ *    or set to self-destruct after the first download.
+ */
+'use strict';
+
+const http = require('http');
+const https = require('https');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const crypto = require('crypto');
+
+// ---------------------------------------------------------------- configuration
+const PORT = parseInt(process.env.PORT || '8080', 10);
+const HOST = process.env.HOST || '0.0.0.0';
+const MAX_STORE_BYTES = parseInt(process.env.MAX_STORE_MB || '2048', 10) * 1024 * 1024;
+const TLS_CERT = process.env.TLS_CERT;
+const TLS_KEY = process.env.TLS_KEY;
+
+const CHUNK_SIZE = 1024 * 1024;                 // plaintext bytes per chunk (must match client)
+const CHUNK_OVERHEAD = 24 + 16;                 // nonce + Poly1305 tag
+const MAX_CHUNK_BODY = CHUNK_SIZE + CHUNK_OVERHEAD;
+const MAX_MANIFEST_BODY = 256 * 1024;
+const MAX_CHUNKS = Math.floor((8 * 1024 * 1024 * 1024) / CHUNK_SIZE); // 8 GiB hard ceiling
+const TTL_CHOICES = [5, 15, 60, 360, 1440];     // minutes
+const UPLOAD_IDLE_MS = 10 * 60 * 1000;          // unsealed shares die after 10 idle minutes
+
+const PUBLIC_DIR = path.join(__dirname, 'public');
+const VENDOR = {
+  'nacl.js': path.join(__dirname, 'node_modules/tweetnacl/nacl-fast.min.js'),
+  'qrcode.js': path.join(__dirname, 'node_modules/qrcode-generator/qrcode.js'),
+};
+
+// ---------------------------------------------------------------- in-memory store
+/** @type {Map<string, Share>} */
+const shares = new Map();
+let storedBytes = 0;
+
+function newId(bytes) {
+  return crypto.randomBytes(bytes).toString('base64url');
+}
+
+function createShare(ttlMin, burn) {
+  const id = newId(16);
+  const share = {
+    id,
+    ownerToken: newId(24),
+    chunks: [],
+    manifest: null,
+    bytes: 0,
+    sealed: false,
+    burn: !!burn,
+    ttlMs: ttlMin * 60 * 1000,
+    expiresAt: Date.now() + UPLOAD_IDLE_MS,
+    opens: 0,
+    downloads: 0,
+  };
+  shares.set(id, share);
+  return share;
+}
+
+function destroyShare(share) {
+  if (!shares.has(share.id)) return;
+  // Drop references and overwrite buffers so ciphertext doesn't linger in memory.
+  for (const c of share.chunks) if (c) c.fill(0);
+  if (share.manifest) share.manifest.fill(0);
+  storedBytes -= share.bytes;
+  share.chunks = [];
+  share.manifest = null;
+  shares.delete(share.id);
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const s of shares.values()) if (s.expiresAt <= now) destroyShare(s);
+}, 5000).unref();
+
+// ---------------------------------------------------------------- http helpers
+const SECURITY_HEADERS = {
+  'Content-Security-Policy': [
+    "default-src 'none'",
+    "script-src 'self'",
+    "style-src 'self'",
+    "img-src 'self' data: blob:",
+    "connect-src 'self'",
+    "manifest-src 'self'",
+    "base-uri 'none'",
+    "form-action 'none'",
+    "frame-ancestors 'none'",
+  ].join('; '),
+  'Referrer-Policy': 'no-referrer',
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'DENY',
+  'Cross-Origin-Resource-Policy': 'same-origin',
+  'Permissions-Policy': 'camera=(), microphone=(), geolocation=(), interest-cohort=()',
+  'Cache-Control': 'no-store',
+};
+
+function send(res, status, body, type = 'application/json') {
+  if (TLS_CERT) res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+  const data = typeof body === 'string' || Buffer.isBuffer(body) ? body : JSON.stringify(body);
+  res.writeHead(status, { ...SECURITY_HEADERS, 'Content-Type': type, 'Content-Length': Buffer.byteLength(data) });
+  res.end(data);
+}
+
+const fail = (res, status, error) => send(res, status, { error });
+
+function readBody(req, limit) {
+  return new Promise((resolve, reject) => {
+    const parts = [];
+    let size = 0;
+    req.on('data', (d) => {
+      size += d.length;
+      if (size > limit) {
+        reject(Object.assign(new Error('Payload too large'), { status: 413 }));
+        req.destroy();
+        return;
+      }
+      parts.push(d);
+    });
+    req.on('end', () => resolve(Buffer.concat(parts, size)));
+    req.on('error', reject);
+  });
+}
+
+function isOwner(req, share) {
+  const token = req.headers['x-owner-token'];
+  if (typeof token !== 'string' || token.length !== share.ownerToken.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(token), Buffer.from(share.ownerToken));
+}
+
+function publicInfo(share) {
+  return {
+    sealed: share.sealed,
+    chunks: share.chunks.length,
+    burn: share.burn,
+    expiresAt: share.expiresAt,
+  };
+}
+
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.json': 'application/manifest+json',
+  '.png': 'image/png',
+};
+
+function serveFile(res, file) {
+  fs.readFile(file, (err, data) => {
+    if (err) return fail(res, 404, 'Not found');
+    send(res, 200, data, MIME[path.extname(file)] || 'application/octet-stream');
+  });
+}
+
+function lanAddresses() {
+  const out = [];
+  for (const [name, list] of Object.entries(os.networkInterfaces())) {
+    for (const a of list || []) {
+      if (a.family === 'IPv4' && !a.internal) out.push({ name, address: a.address });
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------- router
+async function handle(req, res) {
+  const url = new URL(req.url, 'http://x');
+  const p = url.pathname;
+  const m = req.method;
+
+  try {
+    // ---- API -------------------------------------------------------------
+    if (p === '/api/info' && m === 'GET') {
+      const proto = TLS_CERT ? 'https' : 'http';
+      return send(res, 200, {
+        chunkSize: CHUNK_SIZE,
+        ttlChoices: TTL_CHOICES,
+        freeBytes: Math.max(0, MAX_STORE_BYTES - storedBytes),
+        origins: lanAddresses().map((a) => ({ name: a.name, origin: `${proto}://${a.address}:${PORT}` })),
+      });
+    }
+
+    if (p === '/api/s' && m === 'POST') {
+      const body = JSON.parse((await readBody(req, 1024)).toString() || '{}');
+      const ttl = TTL_CHOICES.includes(body.ttl) ? body.ttl : 60;
+      const need = Number(body.bytes) || 0;
+      if (need > MAX_STORE_BYTES - storedBytes) return fail(res, 507, 'Not enough free memory on the host for this share');
+      const s = createShare(ttl, body.burn);
+      return send(res, 201, { id: s.id, ownerToken: s.ownerToken });
+    }
+
+    const sm = p.match(/^\/api\/s\/([A-Za-z0-9_-]{22})(?:\/(c|m|a)(?:\/(\d{1,7}))?)?$/);
+    if (sm) {
+      const share = shares.get(sm[1]);
+      // Same response for "never existed" and "expired" — reveals nothing.
+      if (!share) return fail(res, 404, 'This share does not exist or has expired');
+      const kind = sm[2];
+      const index = sm[3] !== undefined ? parseInt(sm[3], 10) : undefined;
+
+      if (!kind && m === 'GET') {
+        const info = publicInfo(share);
+        if (isOwner(req, share)) Object.assign(info, { opens: share.opens, downloads: share.downloads });
+        return send(res, 200, info);
+      }
+
+      if (!kind && m === 'DELETE') {
+        // Owners can revoke anytime; recipients may burn a burn-after-reading share.
+        if (!isOwner(req, share) && !(share.burn && share.sealed)) return fail(res, 403, 'Forbidden');
+        destroyShare(share);
+        return send(res, 200, { ok: true });
+      }
+
+      // Upload a ciphertext chunk.
+      if (kind === 'c' && m === 'PUT' && index !== undefined) {
+        if (!isOwner(req, share)) return fail(res, 403, 'Forbidden');
+        if (share.sealed) return fail(res, 409, 'Share is sealed');
+        if (index >= MAX_CHUNKS) return fail(res, 413, 'Share too large');
+        const body = await readBody(req, MAX_CHUNK_BODY);
+        if (body.length !== MAX_CHUNK_BODY) return fail(res, 400, 'Chunks must be padded to full size');
+        if (storedBytes + body.length > MAX_STORE_BYTES) return fail(res, 507, 'Host memory budget exhausted');
+        if (!shares.has(share.id)) return fail(res, 404, 'Share expired');
+        const prev = share.chunks[index];
+        if (prev) { storedBytes -= prev.length; share.bytes -= prev.length; }
+        share.chunks[index] = body;
+        share.bytes += body.length;
+        storedBytes += body.length;
+        share.expiresAt = Date.now() + UPLOAD_IDLE_MS;
+        return send(res, 200, { ok: true });
+      }
+
+      // Upload encrypted manifest — this seals the share.
+      if (kind === 'm' && m === 'PUT') {
+        if (!isOwner(req, share)) return fail(res, 403, 'Forbidden');
+        if (share.sealed) return fail(res, 409, 'Share is sealed');
+        const count = parseInt(req.headers['x-chunk-count'], 10);
+        if (!(count >= 0) || count !== share.chunks.length) return fail(res, 400, 'Chunk count mismatch');
+        for (let i = 0; i < count; i++) if (!share.chunks[i]) return fail(res, 400, `Missing chunk ${i}`);
+        const body = await readBody(req, MAX_MANIFEST_BODY);
+        share.manifest = body;
+        share.bytes += body.length;
+        storedBytes += body.length;
+        share.sealed = true;
+        share.expiresAt = Date.now() + share.ttlMs;
+        return send(res, 200, publicInfo(share));
+      }
+
+      if (kind === 'm' && m === 'GET') {
+        if (!share.sealed) return fail(res, 404, 'This share does not exist or has expired');
+        share.opens++;
+        return send(res, 200, share.manifest, 'application/octet-stream');
+      }
+
+      // Recipient confirms a completed save (used for the sender's status display only).
+      if (kind === 'a' && m === 'POST') {
+        if (!share.sealed) return fail(res, 404, 'Not found');
+        share.downloads++;
+        return send(res, 200, { ok: true });
+      }
+
+      if (kind === 'c' && m === 'GET' && index !== undefined) {
+        if (!share.sealed || !share.chunks[index]) return fail(res, 404, 'Not found');
+        return send(res, 200, share.chunks[index], 'application/octet-stream');
+      }
+
+      return fail(res, 405, 'Method not allowed');
+    }
+
+    if (p.startsWith('/api/')) return fail(res, 404, 'Not found');
+
+    // ---- static ----------------------------------------------------------
+    if (m !== 'GET' && m !== 'HEAD') return fail(res, 405, 'Method not allowed');
+    if (p.startsWith('/vendor/')) {
+      const f = VENDOR[p.slice(8)];
+      return f ? serveFile(res, f) : fail(res, 404, 'Not found');
+    }
+    // Receiver links look like /r/<id>#<key>; they load the same single-page app.
+    if (p === '/' || /^\/r\/[A-Za-z0-9_-]{22}$/.test(p)) return serveFile(res, path.join(PUBLIC_DIR, 'index.html'));
+    const file = path.normalize(path.join(PUBLIC_DIR, p));
+    if (!file.startsWith(PUBLIC_DIR + path.sep)) return fail(res, 404, 'Not found');
+    return serveFile(res, file);
+  } catch (err) {
+    if (!res.headersSent) fail(res, err.status || 400, err.status ? err.message : 'Bad request');
+  }
+}
+
+// ---------------------------------------------------------------- start
+const server = TLS_CERT && TLS_KEY
+  ? https.createServer({ cert: fs.readFileSync(TLS_CERT), key: fs.readFileSync(TLS_KEY) }, handle)
+  : http.createServer(handle);
+
+server.requestTimeout = 5 * 60 * 1000;
+
+server.listen(PORT, HOST, () => {
+  const proto = TLS_CERT ? 'https' : 'http';
+  const c = (s, n) => (process.stdout.isTTY ? `\x1b[${n}m${s}\x1b[0m` : s);
+  console.log(`\n  ${c('LocShare', '1;35')}  ${c('private file sharing on your network', '2')}\n`);
+  console.log(`  ${c('Local:', '2')}    ${proto}://localhost:${PORT}`);
+  for (const a of lanAddresses()) console.log(`  ${c('Network:', '2')}  ${c(`${proto}://${a.address}:${PORT}`, '36')}  ${c(a.name, '2')}`);
+  console.log(`\n  ${c('End-to-end encrypted · RAM only · no logs', '2')}\n`);
+});
+
+function shutdown() {
+  for (const s of [...shares.values()]) destroyShare(s);
+  process.exit(0);
+}
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);

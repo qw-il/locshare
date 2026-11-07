@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="referrer" content="no-referrer">
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#07060d">
+  <title>LocShare</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/vendor/nacl.js" defer></script>
+  <script src="/vendor/qrcode.js" defer></script>
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div class="aurora" aria-hidden="true">
+    <span class="blob b1"></span><span class="blob b2"></span><span class="blob b3"></span><span class="blob b4"></span>
+  </div>
+  <div class="grain" aria-hidden="true"></div>
+
+  <header class="top">
+    <a class="brand" href="/" data-nav="home">
+      <svg class="logo" viewBox="0 0 32 32" aria-hidden="true">
+        <defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#a78bfa"/><stop offset="1" stop-color="#22d3ee"/></linearGradient></defs>
+        <rect x="3" y="3" width="26" height="26" rx="9" fill="url(#lg)"/>
+        <path d="M11 17.5l3.5 3.5L21.5 12" fill="none" stroke="#0b0914" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <span>LocShare</span>
+    </a>
+    <button class="badge" id="privacyBtn" type="button" aria-haspopup="dialog">
+      <span class="pulse"></span> End-to-end encrypted
+    </button>
+  </header>
+
+  <main id="app">
+    <!-- ============================== SEND ============================== -->
+    <section class="view hidden" id="view-send" data-view="send">
+      <div class="hero">
+        <h1>Share files across your network.<br><span class="grad">Seen by no one else.</span></h1>
+        <p class="sub">Encrypted in your browser before they leave your device. The host only ever holds scrambled bytes — in memory, for as long as you choose.</p>
+      </div>
+
+      <div class="card glow" id="sendCard">
+        <div class="seg" role="tablist" id="modeSeg">
+          <span class="seg-pill" aria-hidden="true"></span>
+          <button role="tab" class="seg-btn active" data-mode="files" aria-selected="true">Files</button>
+          <button role="tab" class="seg-btn" data-mode="note" aria-selected="false">Note</button>
+        </div>
+
+        <div class="pane" data-pane="files">
+          <label class="drop" id="drop" tabindex="0">
+            <input type="file" id="fileInput" multiple hidden>
+            <span class="drop-ring" aria-hidden="true"></span>
+            <span class="drop-icon" aria-hidden="true">
+              <svg viewBox="0 0 48 48"><path d="M24 31V13m0 0l-7 7m7-7l7 7" /><path d="M10 30v4a5 5 0 005 5h18a5 5 0 005-5v-4" /></svg>
+            </span>
+            <span class="drop-title">Drop files here</span>
+            <span class="drop-sub">or <u>browse</u> · paste works too</span>
+          </label>
+          <ul class="files" id="fileList"></ul>
+        </div>
+
+        <div class="pane hidden" data-pane="note">
+          <textarea id="noteInput" class="note" rows="7" placeholder="Write something private — a password, a link, a thought…" spellcheck="false"></textarea>
+        </div>
+
+        <div class="opts">
+          <div class="opt">
+            <span class="opt-label">Expires after</span>
+            <div class="chips" id="ttlChips">
+              <span class="chip-pill" aria-hidden="true"></span>
+            </div>
+          </div>
+          <label class="opt toggle">
+            <span class="opt-label">Self-destruct after first download
+              <small>The share is wiped the moment it's received.</small>
+            </span>
+            <input type="checkbox" id="burnToggle">
+            <span class="switch" aria-hidden="true"><span></span></span>
+          </label>
+        </div>
+
+        <button class="cta" id="shareBtn" disabled>
+          <span class="cta-fill" aria-hidden="true"></span>
+          <span class="cta-label">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="11" width="14" height="10" rx="2.5"/><path d="M8 11V8a4 4 0 018 0v3"/></svg>
+            <span class="cta-text">Encrypt &amp; share</span>
+          </span>
+        </button>
+        <p class="summary" id="summary">Add a file or write a note to begin.</p>
+      </div>
+
+      <div class="shares hidden" id="activeWrap">
+        <h3>Active shares <small>this tab only</small></h3>
+        <ul id="activeList"></ul>
+      </div>
+    </section>
+
+    <!-- ============================== LINK ============================== -->
+    <section class="view hidden" id="view-link" data-view="link">
+      <div class="card glow link-card">
+        <div class="success-mark" aria-hidden="true">
+          <svg viewBox="0 0 52 52"><circle cx="26" cy="26" r="24"/><path d="M15 27l7 7 15-16"/></svg>
+        </div>
+        <h2>Ready to receive</h2>
+        <p class="sub small">Scan with a phone on the same network, or copy the link. The decryption key is inside the link itself — anyone holding it can open the share, so send it only to people you trust.</p>
+
+        <div class="qr-wrap">
+          <canvas id="qr" width="560" height="560" aria-label="QR code of share link"></canvas>
+          <div class="qr-scan" aria-hidden="true"></div>
+        </div>
+
+        <div class="link-row">
+          <input id="linkOut" readonly spellcheck="false" aria-label="Share link">
+          <button class="icon-btn" id="copyBtn" title="Copy link">
+            <svg viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="3"/><path d="M16 8V6a2 2 0 00-2-2H6a2 2 0 00-2 2v8a2 2 0 002 2h2"/></svg>
+          </button>
+        </div>
+        <div class="origin-row hidden" id="originRow">
+          <span>Network</span>
+          <select id="originSel"></select>
+        </div>
+
+        <div class="status-row">
+          <div class="ring" id="ttlRing">
+            <svg viewBox="0 0 40 40"><circle class="track" cx="20" cy="20" r="17"/><circle class="bar" cx="20" cy="20" r="17"/></svg>
+            <span id="ttlText">--</span>
+          </div>
+          <div class="status-text">
+            <strong id="statusTitle">Waiting for recipient</strong>
+            <span id="statusSub">Nothing has been opened yet.</span>
+          </div>
+        </div>
+
+        <div class="btn-row">
+          <button class="ghost danger" id="revokeBtn">Revoke now</button>
+          <button class="ghost" id="newBtn">Share something else</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================= RECEIVE ============================ -->
+    <section class="view hidden" id="view-recv" data-view="recv">
+      <div class="card glow recv-card">
+        <div class="lock" id="lockAnim" aria-hidden="true">
+          <svg viewBox="0 0 64 64">
+            <path class="shackle" d="M20 29v-7a12 12 0 0124 0v7"/>
+            <rect class="body" x="13" y="29" width="38" height="27" rx="8"/>
+            <circle class="hole" cx="32" cy="41" r="3.2"/>
+          </svg>
+        </div>
+        <h2 id="recvTitle">Decrypting…</h2>
+        <p class="sub small" id="recvSub">Unlocking the share with the key from your link.</p>
+
+        <div class="note-out hidden" id="noteOut">
+          <pre id="noteText"></pre>
+          <button class="icon-btn" id="noteCopy" title="Copy note">
+            <svg viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="3"/><path d="M16 8V6a2 2 0 00-2-2H6a2 2 0 00-2 2v8a2 2 0 002 2h2"/></svg>
+          </button>
+        </div>
+
+        <ul class="files recv-files" id="recvList"></ul>
+
+        <button class="cta hidden" id="saveAllBtn">
+          <span class="cta-fill" aria-hidden="true"></span>
+          <span class="cta-label">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11m0 0l-4.5-4.5M12 15l4.5-4.5"/><path d="M5 19h14"/></svg>
+            <span class="cta-text">Save all</span>
+          </span>
+        </button>
+        <p class="summary" id="recvMeta"></p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <span>Files never touch a disk on the host · no accounts · no logs · no trackers</span>
+  </footer>
+
+  <!-- privacy sheet -->
+  <dialog id="privacyDlg" class="sheet">
+    <h3>How your privacy is protected</h3>
+    <ul class="facts">
+      <li><b>Encrypted on your device.</b> Files, names and notes are sealed with XSalsa20‑Poly1305 in your browser before upload.</li>
+      <li><b>The key never reaches the host.</b> It lives after the <code>#</code> in the link — browsers never send that part to servers.</li>
+      <li><b>Sizes are blurred.</b> Data is padded to 1&nbsp;MiB blocks, so even file sizes stay vague.</li>
+      <li><b>Memory only.</b> The host keeps ciphertext in RAM, never on disk, and wipes it on expiry, revoke or self‑destruct.</li>
+      <li><b>Unlisted.</b> No one can browse shares. Each has a random 128‑bit address that can't be guessed.</li>
+      <li><b>Tamper‑proof.</b> Every block is authenticated; any modification is detected and rejected.</li>
+      <li><b>Zero third parties.</b> No CDNs, fonts, analytics or cookies. Everything is served from your machine.</li>
+    </ul>
+    <button class="ghost" id="privacyClose">Got it</button>
+  </dialog>
+
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+</body>
+</html>

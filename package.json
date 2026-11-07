@@ -1,0 +1,34 @@
+{
+  "name": "locshare",
+  "version": "1.0.0",
+  "description": "Private, end-to-end encrypted file sharing over your local network",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/qw-il/locshare.git"
+  },
+  "keywords": [
+    "file-sharing",
+    "lan",
+    "e2ee",
+    "privacy"
+  ],
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/qw-il/locshare/issues"
+  },
+  "homepage": "https://github.com/qw-il/locshare#readme",
+  "dependencies": {
+    "qrcode-generator": "^1.4.4",
+    "tweetnacl": "^1.0.3"
+  },
+  "bin": {
+    "locshare": "server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
