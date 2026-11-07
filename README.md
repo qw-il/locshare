@@ -42,6 +42,8 @@ Click **Pair a device**, then scan the QR code on a phone, tablet or laptop on t
 
 - **How it's protected.** The session key lives only in the QR code or link fragment. Device names, messages and file offers are sealed with that key before they're sent, and the server just relays opaque bytes between connected devices. A device that joins without the key sees nothing it can decrypt and is ignored.
 - **How files travel.** Each file streams live from the sender's tab: the other device starts pulling encrypted blocks the moment you drop it, with no upload step and no size limit.
+  - Blocks are encrypted on several CPU cores. Over HTTPS that is AES-256-GCM in hardware; over plain HTTP it is XSalsa20-Poly1305.
+  - A large copy moves about 16 MB per request, with several requests in flight, so it can fill a gigabit link instead of waiting on one block at a time.
   - Batches up to 256 MB are decrypted automatically on arrival, so saving them is instant. You can also turn on auto-download.
   - Larger batches stream straight to disk when you tap save.
 - **When it ends.** Leaving a session, or closing every tab in it, ends it. Any transfers in progress are revoked and wiped.
@@ -99,9 +101,9 @@ On the recipient's side, files are decrypted block by block:
 
 ## How privacy is protected
 
-- **End-to-end encryption.** Files, file names, types, sizes and notes are encrypted in the browser with XSalsa20‑Poly1305 (NaCl `secretbox`, via [tweetnacl](https://github.com/dchest/tweetnacl-js)). A fresh random 256‑bit key is generated for every share.
+- **End-to-end encryption.** Files, file names, types, sizes and notes are encrypted in the browser before they leave the device. A fresh random 256‑bit key is generated for every share. File blocks use AES-256-GCM on HTTPS pages (WebCrypto, hardware accelerated, across several CPU cores). On plain HTTP, where WebCrypto is unavailable, file blocks use XSalsa20‑Poly1305 (NaCl `secretbox`, via [tweetnacl](https://github.com/dchest/tweetnacl-js)), also across several cores. Notes and manifests always use XSalsa20‑Poly1305.
 - **The key never reaches the server.** It is placed after the `#` in the link (`/r/<id>#<key>`), and browsers never send that part over the network. When the recipient opens the link, the key is moved into tab-scoped memory and removed from the address bar and browser history.
-- **Sizes are hidden.** Data is padded to 1 MiB blocks and the manifest to 4 KiB, so the server can't tell how many files there are, what they are called, or their exact sizes.
+- **Sizes are hidden.** Data is padded to fixed blocks — 1 MiB for smaller shares, 4 MiB once a share is 32 MiB or larger — and the manifest to 4 KiB, so the server can't tell how many files there are, what they are called, or their exact sizes.
 - **Tamper detection.** Every block is authenticated, and its nonce is tied to its position, so blocks can't be modified, swapped, reordered or truncated without being detected.
 - **RAM only, no logs.** Ciphertext is never written to disk. Buffers are zeroed when a share expires, is revoked or self-destructs, or when the server stops. Nothing about requests is logged.
 - **Unlisted.** Shares can't be browsed or listed. Each has a random 128‑bit ID, and a missing share and an expired share return the same response.
@@ -116,4 +118,8 @@ On the recipient's side, files are decrypted block by block:
 
 ## Tip for very large files
 
-Run `npm run https` and receive in Chrome or Edge. The browser then streams decrypted data straight to disk, so even a file larger than the recipient's RAM saves smoothly.
+A share bigger than the host's memory (a 180 GB disk image, for example) is not stored. It streams live from the sending tab, and that tab has to stay open until the save finishes.
+
+Run `npm run https` and open the `https://` address in Chrome or Edge on both devices. Encryption then uses AES-256-GCM on several cores, and the browser writes decrypted data straight to disk, so a copy larger than the recipient's RAM still completes. The speed you get is whichever is slower: the network between the two devices, or the disk the file is being written to. Pick a folder under **Save to** beforehand if you want it to land without a dialog.
+
+On plain HTTP the same stream works, but encryption is in JavaScript and will usually be the limit. A spinning hard drive on the receiving side will be the limit even over HTTPS.

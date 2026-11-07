@@ -47,6 +47,19 @@
   }
   const ttlLabel = (m) => (m >= 60 ? `${m / 60}h` : `${m}m`);
 
+  // Average throughput since the first bytes moved. Quiet until a transfer is actually moving.
+  function pace() {
+    let t0 = 0;
+    return (bytes) => {
+      if (!(bytes > 0)) return '';
+      if (!t0) t0 = performance.now();
+      if (bytes < 256 * 1024) return '';
+      const dt = (performance.now() - t0) / 1000;
+      if (dt < 0.5) return '';
+      return `${fmtBytes(bytes / dt)}/s`;
+    };
+  }
+
   function toast(msg, kind = '') {
     const t = h('div', { class: `toast ${kind}` }, msg);
     $('#toasts').append(t);
@@ -206,7 +219,10 @@
   }
 
   // ============================================================ crypto
-  // XSalsa20-Poly1305 (NaCl secretbox). Works in plain-http LAN pages, where WebCrypto is unavailable.
+  // File blocks are sealed off the main thread, one worker per core.
+  // HTTPS pages use AES-256-GCM (hardware). Plain HTTP, where WebCrypto is unavailable, uses
+  // XSalsa20-Poly1305. Notes, manifests and room messages stay on NaCl here — they're tiny and
+  // their nonce is random, not derived from a block index.
   const NONCE = 24;
   let CHUNK = 1024 * 1024;
 
@@ -239,6 +255,144 @@
     if (!plain) return null;
     const len = new DataView(plain.buffer, plain.byteOffset).getUint32(0);
     return JSON.parse(new TextDecoder().decode(plain.subarray(4, 4 + len)));
+  }
+
+  function makeSemaphore(max) {
+    let used = 0;
+    const q = [];
+    return {
+      acquire() {
+        if (used < max) { used++; return Promise.resolve(); }
+        return new Promise((resolve) => q.push(resolve));
+      },
+      release() {
+        const next = q.shift();
+        if (next) next();
+        else used--;
+      },
+    };
+  }
+
+  // File-block cipher. The same key bytes feed either algorithm; the manifest records which.
+  const blocks = (() => {
+    const useAes = location.protocol === 'https:' && !!(globalThis.crypto && crypto.subtle);
+    const cipher = useAes ? 'aes-256-gcm' : 'xsalsa20poly1305';
+    const cores = Math.min(4, navigator.hardwareConcurrency || 2);
+    const slots = makeSemaphore(cores * 2);
+    const workers = [];
+    const pending = new Map();
+    let seq = 0;
+    let rr = 0;
+    let broken = false;
+
+    function failWorker(w, err) {
+      for (const [id, job] of pending) {
+        if (job.w === w) { pending.delete(id); job.reject(err); }
+      }
+    }
+    try {
+      for (let i = 0; i < cores; i++) {
+        const w = new Worker('/crypto-worker.js');
+        w.onmessage = (e) => {
+          const job = pending.get(e.data.id);
+          if (!job) return;
+          pending.delete(e.data.id);
+          if (e.data.error) {
+            const error = new Error(e.data.error === 'tamper' ? 'Integrity check failed — data was tampered with' : e.data.error);
+            if (e.data.error === 'tamper') error.fatal = true;
+            job.reject(error);
+          } else job.resolve(new Uint8Array(e.data.out, e.data.off || 0, e.data.len));
+        };
+        w.onerror = () => { broken = true; failWorker(w, new Error('Encryption worker failed')); };
+        workers.push(w);
+      }
+    } catch { broken = true; }
+
+    const aesKeys = new WeakMap();
+    function aesIv(prefix, index) {
+      const iv = new Uint8Array(12);
+      iv.set(prefix.subarray(0, 4), 0);
+      new DataView(iv.buffer).setBigUint64(4, BigInt(index));
+      return iv;
+    }
+    async function aesKey(raw) {
+      let p = aesKeys.get(raw);
+      if (!p) {
+        p = crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+        aesKeys.set(raw, p);
+      }
+      return p;
+    }
+    async function localRun(op, data, index, key, prefix, which) {
+      if (which === 'aes-256-gcm') {
+        const iv = aesIv(prefix, index);
+        const k = await aesKey(key);
+        if (op === 'seal') {
+          const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, k, data));
+          data.fill(0);
+          const out = new Uint8Array(NONCE + ct.length);
+          out.set(iv, 0);
+          out.set(ct, NONCE);
+          return out;
+        }
+        try {
+          return new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, k, data.subarray(NONCE)));
+        } catch {
+          throw Object.assign(new Error('Integrity check failed — data was tampered with'), { fatal: true });
+        }
+      }
+      if (op === 'seal') {
+        const out = seal(data, chunkNonce(prefix, index), key);
+        data.fill(0);
+        return out;
+      }
+      const plain = nacl.secretbox.open(data.subarray(NONCE), chunkNonce(prefix, index), key);
+      if (!plain) throw Object.assign(new Error('Integrity check failed — data was tampered with'), { fatal: true });
+      return plain;
+    }
+    function call(op, bytes, index, key, prefix, which) {
+      if (broken || !workers.length) return localRun(op, bytes, index, key, prefix, which);
+      const w = workers[rr++ % workers.length];
+      const id = ++seq;
+      return new Promise((resolve, reject) => {
+        pending.set(id, { resolve, reject, w });
+        try {
+          const msg = { id, op, cipher: which, index, key, prefix };
+          if (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength) {
+            msg.data = bytes.buffer;
+            w.postMessage(msg, [bytes.buffer]);
+          } else {
+            msg.data = bytes;
+            w.postMessage(msg);
+          }
+        } catch (err) {
+          pending.delete(id);
+          reject(err);
+        }
+      });
+    }
+    async function run(op, bytes, index, key, prefix, which) {
+      await slots.acquire();
+      try { return await call(op, bytes, index, key, prefix, which); }
+      finally { slots.release(); }
+    }
+    return {
+      cipher,
+      seal: (plain, index, key, prefix) => run('seal', plain, index, key, prefix, cipher),
+      open: (boxed, index, key, prefix, which) => run('open', boxed, index, key, prefix, which || cipher),
+    };
+  })();
+
+  function chooseChunk(total) {
+    const sizes = (info.chunkSizes?.length ? info.chunkSizes : [info.chunkSize || CHUNK]).slice().sort((a, b) => a - b);
+    if (total >= 32 * 1024 * 1024 && sizes.length > 1) return sizes[sizes.length - 1];
+    return sizes[0];
+  }
+  // Must match the server's maxBatch(): several chunks per request, about 16 MiB.
+  function maxBatch(chunkBody) {
+    const target = info.batchBytes || (16 * 1024 * 1024 + 64 * 40);
+    const cap = info.batchCap || 8;
+    return Math.max(1, Math.min(cap, Math.floor(target / chunkBody)));
   }
 
   // CRC-32 for the zip writer
@@ -441,7 +595,10 @@
   dlg.addEventListener('click', (e) => { if (e.target === dlg) dlg.close(); });
 
   // ============================================================ server info
-  let info = { chunkSize: CHUNK, ttlChoices: [5, 15, 60, 360, 1440], origins: [] };
+  let info = {
+    chunkSize: CHUNK, chunkSizes: [CHUNK, 4 * CHUNK], batchBytes: 16 * 1024 * 1024 + 64 * 40, batchCap: 8,
+    ttlChoices: [5, 15, 60, 360, 1440], origins: [],
+  };
   const infoReady = api('/api/info').then((r) => r.json()).then((i) => { info = i; CHUNK = i.chunkSize; }).catch(() => {});
 
   const isLoopback = /^(localhost|127\.|\[::1\]$)/.test(location.hostname);
@@ -642,7 +799,8 @@
     shareBtn.disabled = !ok || state.busy;
     let msg = 'Add a file or write a note to begin.';
     if (files.length) {
-      const padded = Math.ceil(total / CHUNK) * CHUNK;
+      const chunk = chooseChunk(total);
+      const padded = Math.ceil(total / chunk) * chunk;
       const what = describe(groupItems(files, (it) => it.path, (it) => it.file.size));
       const count = files.length > 1 && /folder/.test(what) ? ` (${files.length} files)` : '';
       msg = `${what}${count} · ${fmtBytes(total)} — the host will only see ~${fmtBytes(padded || 0)} of noise`;
@@ -695,8 +853,11 @@
       entries.push({ name: f.name, path: it.path, type: f.type, size: f.size, offset: total, modified: f.lastModified });
       total += f.size;
     }
-    const chunks = Math.ceil(total / CHUNK);
-    const bytes = chunks * (CHUNK + 40);
+    // Big copies use 4 MiB blocks. Anything under 32 MiB stays at 1 MiB so small files aren't padded out.
+    const chunk = chooseChunk(total);
+    const chunks = Math.ceil(total / chunk) || 0;
+    const bytes = chunks * (chunk + 40);
+    const batchN = maxBatch(chunk + 40);
 
     // No size limit: if the host can't hold the share in RAM, stream it live from this tab instead.
     const fresh = opts.live ? info : await api('/api/info').then((r) => r.json()).catch(() => info);
@@ -704,7 +865,7 @@
     const open = (asLive) => api('/api/s', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ttl, burn, bytes, live: asLive }),
+      body: JSON.stringify({ ttl, burn, bytes, live: asLive, chunkSize: chunk }),
     });
     let res;
     try { res = await open(live); } catch (err) {
@@ -715,46 +876,60 @@
     const { id, ownerToken } = await res.json();
     const auth = { 'X-Owner-Token': ownerToken };
 
-    // Build chunk i from the virtual concatenation of all files, padded with zeros to CHUNK bytes.
-    async function readChunk(i) {
-      const start = i * CHUNK;
-      const end = Math.min(start + CHUNK, total);
-      const parts = [];
-      // Binary-search the first file overlapping this chunk (folders can hold 100k+ files).
+    // Read `count` chunks as one sequential slice (a 180 GB file should not be read 1 MiB at a time).
+    // Disk reads are queued so parallel uploads don't turn a sequential file into random I/O.
+    let readChain = Promise.resolve();
+    const readSequential = (fn) => {
+      const run = readChain.then(fn, fn);
+      readChain = run.then(() => {}, () => {});
+      return run;
+    };
+    async function readChunks(startIndex, count) {
+      const bufs = Array.from({ length: count }, () => new Uint8Array(chunk));
+      const start = startIndex * chunk;
+      const end = Math.min(start + count * chunk, total);
+      if (start >= end) return bufs;
       let lo = 0;
       let hi = entries.length;
       while (lo < hi) { const mid = (lo + hi) >> 1; if (entries[mid].offset + entries[mid].size <= start) lo = mid + 1; else hi = mid; }
+      const jobs = [];
       for (let k = lo; k < entries.length && entries[k].offset < end; k++) {
         const e = entries[k];
         const a = Math.max(start, e.offset);
         const b = Math.min(end, e.offset + e.size);
-        if (a < b) parts.push(files[k].slice(a - e.offset, b - e.offset));
+        if (a < b) jobs.push(files[k].slice(a - e.offset, b - e.offset).arrayBuffer().then((ab) => ({ at: a - start, bytes: new Uint8Array(ab) })));
       }
-      const buf = new Uint8Array(CHUNK);
-      buf.set(new Uint8Array(await new Blob(parts).arrayBuffer()), 0);
-      return buf;
+      for (const part of await Promise.all(jobs)) {
+        let pos = 0;
+        while (pos < part.bytes.length) {
+          const at = part.at + pos;
+          const into = at % chunk;
+          const n = Math.min(chunk - into, part.bytes.length - pos);
+          bufs[Math.floor(at / chunk)].set(part.bytes.subarray(pos, pos + n), into);
+          pos += n;
+        }
+      }
+      return bufs;
     }
-
-    const sealChunk = async (i) => {
-      const plain = await readChunk(i);
-      const body = seal(plain, chunkNonce(prefix, i), key);
-      plain.fill(0);
-      return body;
-    };
+    async function sealChunks(start, count) {
+      const plains = await readSequential(() => readChunks(start, count));
+      return Promise.all(plains.map((plain, k) => blocks.seal(plain, start + k, key, prefix)));
+    }
 
     let done = 0;
     onProgress(0);
     try {
-      if (!live) await pool(chunks, 3, async (i) => {
-        const plain = await readChunk(i);
-        const body = seal(plain, chunkNonce(prefix, i), key);
-        plain.fill(0);
-        await api(`/api/s/${id}/c/${i}`, { method: 'PUT', headers: auth, body });
-        onProgress(++done / chunks);
+      if (!live && chunks) await pool(Math.ceil(chunks / batchN), 4, async (b) => {
+        const start = b * batchN;
+        const count = Math.min(batchN, chunks - start);
+        const parts = await sealChunks(start, count);
+        await api(`/api/s/${id}/c/${start}?n=${count}`, { method: 'PUT', headers: auth, body: new Blob(parts) });
+        done += count;
+        onProgress(done / chunks);
       });
 
       const manifest = sealManifest({
-        v: 1, prefix: b64u.enc(prefix), chunkSize: CHUNK, chunks, total, files: entries,
+        v: 1, cipher: blocks.cipher, prefix: b64u.enc(prefix), chunkSize: chunk, chunks, total, files: entries,
         note: note || undefined, burn, created: Date.now(), dirs: opts.dirs?.length ? opts.dirs : undefined,
       }, key);
       const sealed = await (await api(`/api/s/${id}/m`, { method: 'PUT', headers: { ...auth, 'X-Chunk-Count': String(chunks) }, body: manifest })).json();
@@ -763,10 +938,15 @@
       const groups = groupItems(items, (it) => it.path, (it) => it.file.size);
       const first = groups[0] ? (groups[0].kind === 'folder' ? `${groups[0].name}/` : groups[0].items[0].file.name) : null;
       const label = first ? (groups.length === 1 ? first : `${first} + ${groups.length - 1} more`) : (opts.dirs?.length ? 'Empty folder' : 'Private note');
-      const share = { id, ownerToken, key: b64u.enc(key), label, expiresAt: sealed.expiresAt, ttlMs: ttl * 60e3, burn, opens: 0, downloads: 0, gone: false, live, senderOnline: false, chunks, served: 0 };
+      const share = {
+        id, ownerToken, key: b64u.enc(key), label, expiresAt: sealed.expiresAt, ttlMs: ttl * 60e3,
+        burn, opens: 0, downloads: 0, gone: false, live, senderOnline: false, chunks, served: 0,
+        chunk, plainTotal: total, pace: pace(),
+      };
+      share.onServe = () => { if (viewing === share) renderStatus(); };
       if (live) {
         // Don't hand out the link until this tab is ready to answer block requests.
-        await Promise.race([new Promise((r) => { share.onReady = r; runLive(share, sealChunk); }), sleep(8000)]);
+        await Promise.race([new Promise((r) => { share.onReady = r; runLive(share, sealChunks); }), sleep(8000)]);
       }
       return share;
     } catch (err) {
@@ -776,18 +956,23 @@
   }
 
   // Live shares: keep a channel open to the host and answer block requests from this tab's files.
-  async function runLive(share, sealChunk) {
+  // Several batches stay in flight so reading, encrypting and uploading overlap.
+  async function runLive(share, sealChunks) {
     const auth = { 'X-Owner-Token': share.ownerToken };
     share.abort = new AbortController();
     let active = 0;
     const queue = [];
+    const PARALLEL = 4;
     const pump = () => {
-      while (active < 4 && queue.length) {
-        const [reqId, i] = queue.shift();
+      while (active < PARALLEL && queue.length) {
+        const [reqId, i, count] = queue.shift();
         active++;
-        sealChunk(i)
-          .then((body) => fetch(`/api/s/${share.id}/c/${i}?r=${reqId}`, { method: 'PUT', headers: auth, body, cache: 'no-store', signal: share.abort.signal }))
-          .then((r) => { if (r.ok) { share.served++; share.onServe?.(); } })
+        sealChunks(i, count)
+          .then((parts) => fetch(`/api/s/${share.id}/c/${i}?r=${reqId}&n=${count}`, {
+            method: 'PUT', headers: auth, body: new Blob(parts), cache: 'no-store',
+            credentials: 'omit', referrerPolicy: 'no-referrer', signal: share.abort.signal,
+          }))
+          .then((r) => { if (r.ok) { share.served += count; share.onServe?.(); } })
           .catch(() => {})
           .finally(() => { active--; pump(); });
       }
@@ -808,8 +993,8 @@
             const line = buf.slice(0, nl);
             buf = buf.slice(nl + 1);
             if (line === 'ready') { share.senderOnline = true; share.onReady?.(); }
-            const m = line.match(/^need (\S+) (\d+)$/);
-            if (m) { queue.push([m[1], +m[2]]); pump(); }
+            const m = line.match(/^need (\S+) (\d+)(?: (\d+))?$/);
+            if (m) { queue.push([m[1], +m[2], Math.max(1, +(m[3] || 1))]); pump(); }
           }
         }
       } catch { /* network blip or aborted */ }
@@ -909,6 +1094,17 @@
     if (s.downloads > 0) {
       title.textContent = `Received ${s.downloads > 1 ? `${s.downloads}×` : ''}`.trim();
       sub.textContent = 'The recipient has downloaded the files.';
+    } else if (s.live && s.chunks && s.served > 0) {
+      const p = Math.min(1, s.served / s.chunks);
+      const sent = Math.min(s.plainTotal || 0, s.served * (s.chunk || CHUNK));
+      const speed = s.pace ? s.pace(sent) : '';
+      if (p >= 1) {
+        title.textContent = 'Delivered';
+        sub.textContent = 'The recipient has the data. Keep this tab open until their save finishes.';
+      } else {
+        title.textContent = `Sending · ${Math.round(p * 100)}%${speed ? ` · ${speed}` : ''}`;
+        sub.textContent = 'Streaming live from this tab — keep it open until they’re done.';
+      }
     } else if (s.opens > 0) {
       title.textContent = `Opened ${s.opens > 1 ? `${s.opens}×` : ''}`.trim();
       sub.textContent = 'Someone with the link unlocked the share.';
@@ -941,7 +1137,10 @@
         ul.prepend(li);
       }
       const bits = [`${fmtLeft(s.expiresAt - Date.now())} left`];
-      if (s.live) bits.push('live · keep tab open');
+      if (s.live) {
+        const p = s.chunks ? Math.min(1, s.served / s.chunks) : 0;
+        bits.push(p > 0 && p < 1 ? `sending ${Math.round(p * 100)}%` : 'live · keep tab open');
+      }
       if (s.burn) bits.push('self-destructs');
       if (s.opens) bits.push(`opened ${s.opens}×`);
       $('.act-meta', li).textContent = bits.join(' · ');
@@ -1136,49 +1335,110 @@
   function makeReader(id, key, manifest) {
     const prefix = b64u.dec(manifest.prefix);
     const C = manifest.chunkSize;
+    const cipher = manifest.cipher === 'aes-256-gcm' ? 'aes-256-gcm' : 'xsalsa20poly1305';
     const files = manifest.files;
     const total = files.reduce((s, f) => s + f.size, 0);
     const kept = new Map(); // idx -> { blob, crc }: decrypted copies held in memory
+    const batchN = maxBatch(C + 40);
 
-    async function getChunk(i) {
+    // Pull `count` ciphertext blocks in one response and decrypt each as it arrives.
+    async function fetchRange(start, count) {
+      if (cipher === 'aes-256-gcm' && !(globalThis.crypto && crypto.subtle)) {
+        throw Object.assign(new Error('This transfer uses AES-GCM. Open the https:// address of this LocShare to receive it.'), { fatal: true });
+      }
+      const size = C + 40;
       for (let attempt = 0; ; attempt++) {
         try {
-          const buf = new Uint8Array(await (await api(`/api/s/${id}/c/${i}`)).arrayBuffer());
-          // Always use the nonce *we* expect for this index — blocks can't be swapped or reordered.
-          const plain = nacl.secretbox.open(buf.subarray(NONCE), chunkNonce(prefix, i), key);
-          if (!plain) throw Object.assign(new Error('Integrity check failed — data was tampered with'), { fatal: true });
-          return plain;
+          const res = await api(`/api/s/${id}/c/${start}?n=${count}`);
+          const reader = res.body.getReader();
+          const openings = new Array(count);
+          let frame = new Uint8Array(size);
+          let filled = 0;
+          let got = 0;
+          for (;;) {
+            const { value, done } = await reader.read();
+            if (value) {
+              let off = 0;
+              while (off < value.length) {
+                const n = Math.min(size - filled, value.length - off);
+                frame.set(value.subarray(off, off + n), filled);
+                filled += n;
+                off += n;
+                if (filled === size) {
+                  if (got >= count) throw Object.assign(new Error('Unexpected extra data'), { fatal: true });
+                  openings[got] = blocks.open(frame, start + got, key, prefix, cipher);
+                  got++;
+                  frame = new Uint8Array(size);
+                  filled = 0;
+                }
+              }
+            }
+            if (done) break;
+          }
+          if (got !== count || filled !== 0) throw new Error('Incomplete block');
+          return await Promise.all(openings);
         } catch (err) {
           // A live sender can blip (tab reconnecting, phone busy): retry briefly before giving up.
-          if (err.fatal || err.status === 404 || err.status === 410 || attempt >= 4) throw err;
-          await sleep(700 * (attempt + 1));
+          if (err.fatal || err.status === 404 || err.status === 410 || err.status === 400 || attempt >= 4) throw err;
+          await sleep(400 * (attempt + 1));
         }
       }
     }
 
-    // Decrypt one file block by block, in order, with a few blocks fetched ahead.
-    // Each piece is handed to `write` and can be dropped right after — memory use stays flat.
+    // Decrypt one file in order, with several batches fetched ahead of the disk write.
+    // Plaintext is handed to `write` in ~8 MiB pieces and can be dropped right after.
     async function streamFile(idx, write, onProgress, wantCrc) {
       const f = files[idx];
       if (kept.has(idx)) { const k = kept.get(idx); await write(k.blob); onProgress?.(1); return k.crc; }
       if (f.size === 0) { onProgress?.(1); return 0; }
       const first = Math.floor(f.offset / C);
       const n = Math.floor((f.offset + f.size - 1) / C) - first + 1;
-      const AHEAD = 4;
+      const PARALLEL = 4;
       const inflight = new Map();
-      const start = (k) => { const pr = getChunk(first + k); pr.catch(() => {}); inflight.set(k, pr); };
-      for (let k = 0; k < Math.min(AHEAD, n); k++) start(k);
+      let scheduled = 0;
+      const launch = () => {
+        while (inflight.size < PARALLEL && scheduled < n) {
+          const k = scheduled;
+          const count = Math.min(batchN, n - k);
+          scheduled += count;
+          const pr = fetchRange(first + k, count);
+          pr.catch(() => {});
+          inflight.set(k, { count, pr });
+        }
+      };
+      launch();
       let crc = 0;
-      for (let k = 0; k < n; k++) {
-        const plain = await inflight.get(k);
+      const WRITE = 8 * 1024 * 1024;
+      let bin = [];
+      let binSize = 0;
+      const flush = async () => {
+        if (!binSize) return;
+        const payload = bin.length === 1 ? bin[0] : new Blob(bin);
+        bin = [];
+        binSize = 0;
+        await write(payload);
+      };
+      let doneChunks = 0;
+      for (let k = 0; k < n;) {
+        const job = inflight.get(k);
         inflight.delete(k);
-        if (k + AHEAD < n) start(k + AHEAD);
-        const i = first + k;
-        const part = plain.subarray(Math.max(f.offset, i * C) - i * C, Math.min(f.offset + f.size, (i + 1) * C) - i * C);
-        if (wantCrc) crc = crc32(part, crc);
-        await write(part);
-        onProgress?.((k + 1) / n);
+        const plains = await job.pr;
+        launch();
+        for (let j = 0; j < job.count; j++, k++) {
+          const plain = plains[j];
+          const i = first + k;
+          let part = plain.subarray(Math.max(f.offset, i * C) - i * C, Math.min(f.offset + f.size, (i + 1) * C) - i * C);
+          if (wantCrc) crc = crc32(part, crc);
+          // A view into a larger block must be copied. Some writers ignore byteOffset and would
+          // append the padding that hides the real file size.
+          if (part.byteLength && (part.byteOffset !== 0 || part.byteLength !== part.buffer.byteLength)) part = part.slice();
+          if (part.length) { bin.push(part); binSize += part.length; }
+          if (binSize >= WRITE) await flush();
+          doneChunks++;
+          onProgress?.(doneChunks / n);
+        }
       }
+      await flush();
       return crc;
     }
 
@@ -1305,11 +1565,20 @@
     const icon = fileIcon(f.name, f.type);
     const label = opts.label || f.name;
     const btn = opts.button === false ? null : h('button', { class: 'dl-btn', title: 'Save', 'aria-label': `Save ${label}`, html: ICON.dl });
+    const sizeEl = h('div', { class: 'fsize' }, fmtBytes(f.size));
     const li = h('li', { class: 'file', style: `--i:${opts.i ?? idx}` },
       icon,
-      h('div', { class: 'fmeta' }, h('div', { class: 'fname', title: label }, label), h('div', { class: 'fsize' }, fmtBytes(f.size)), bar),
+      h('div', { class: 'fmeta' }, h('div', { class: 'fname', title: label }, label), sizeEl, bar),
       btn);
-    const progress = (p) => { bar.style.display = ''; bar.style.setProperty('--p', p); };
+    const rate = pace();
+    const progress = (p) => {
+      bar.style.display = '';
+      bar.style.setProperty('--p', p);
+      if (f.size >= 8 * 1024 * 1024 && p > 0) {
+        const speed = rate(p * f.size);
+        sizeEl.textContent = `${Math.round(p * 100)}%${speed ? ` · ${speed}` : ''} · ${fmtBytes(f.size)}`;
+      }
+    };
     const thumb = () => {
       if (kindOf(f.name, f.type).k === 'img' && f.size <= 6e6 && !/svg/.test(f.type)) {
         reader.keep(idx).then(({ blob }) => setThumb(icon, URL.createObjectURL(blob))).catch(() => {});
@@ -1523,12 +1792,14 @@
       };
       relabel();
       saveLabels.add(relabel);
+      const rate = pace();
       saveAll.onclick = async () => {
         if (saveAll.classList.contains('busy') || saveAll.disabled) return;
         try {
           const pending = reader.saveAll((frac, idx, p) => {
             view.progress(idx, p);
-            setProgress(saveAll, frac, `Decrypting · ${Math.round(frac * 100)}%`);
+            const speed = rate(frac * reader.total);
+            setProgress(saveAll, frac, `Saving · ${Math.round(frac * 100)}%${speed ? ` · ${speed}` : ''}`);
           });
           saveAll.classList.add('busy');
           await pending;
@@ -1811,10 +2082,18 @@
     try {
       const share = await createShare(items, '', () => {}, { live: true, ttl: 1440, burn: false, dirs });
       room.shares.push(share);
+      const prevServe = share.onServe;
       share.onServe = () => {
+        prevServe?.();
         const p = share.chunks ? Math.min(1, share.served / share.chunks) : 1;
+        const sent = Math.min(total, share.served * (share.chunk || CHUNK));
+        const speed = share.pace ? share.pace(sent) : '';
         bar.style.setProperty('--p', p);
-        if (!li.classList.contains('delivered')) foot.textContent = p < 1 ? `Sending · ${Math.round(p * 100)}%` : 'Sent — waiting for confirmation…';
+        if (!li.classList.contains('delivered')) {
+          foot.textContent = p < 1
+            ? `Sending · ${Math.round(p * 100)}%${speed ? ` · ${speed}` : ''}`
+            : 'Sent — waiting for confirmation…';
+        }
       };
       // Only the share id + key travel in the message; names and paths stay inside the encrypted manifest.
       await roomSend({ t: 'files', id, share: share.id, key: share.key });
@@ -1866,7 +2145,7 @@
 
     if (reader.total > AUTO_RECEIVE) {
       foot.textContent = canSaveFolders || saveDest.handle
-        ? `${fmtBytes(reader.total)} — tap save to stream it straight to disk`
+        ? `${fmtBytes(reader.total)} — tap save to stream it straight to disk. Keep the sender’s tab open.`
         : reader.total > HUGE ? hugeWarning(reader.total) : `${fmtBytes(reader.total)} — tap save to download`;
       roomSend({ t: 'got', id: msg.id }, from).catch(() => {});
       return;

@@ -4,7 +4,8 @@
  *
  * Privacy model
  * -------------
- *  - Files are encrypted in the sender's browser (XSalsa20-Poly1305) before upload.
+ *  - Files are encrypted in the sender's browser before upload.
+ *    HTTPS uses AES-256-GCM; plain HTTP uses XSalsa20-Poly1305.
  *    The key lives only in the link's #fragment, which browsers never send to servers.
  *  - File names, types, sizes and notes are encrypted too (inside the manifest).
  *  - Content is padded to fixed-size chunks, so the server only learns a rounded size.
@@ -22,6 +23,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
+const { pipeline } = require('stream');
 
 // ---------------------------------------------------------------- configuration
 const PORT = parseInt(process.env.PORT || '8080', 10);
@@ -33,9 +35,16 @@ const TLS_KEY = process.env.TLS_KEY;
 const AUTO_TLS = !TLS_CERT && (process.argv.includes('--https') || /^(1|true|yes)$/i.test(process.env.HTTPS || ''));
 const USE_TLS = !!(TLS_CERT && TLS_KEY) || AUTO_TLS;
 
-const CHUNK_SIZE = 1024 * 1024;                 // plaintext bytes per chunk (must match client)
-const CHUNK_OVERHEAD = 24 + 16;                 // nonce + Poly1305 tag
-const MAX_CHUNK_BODY = CHUNK_SIZE + CHUNK_OVERHEAD;
+const CHUNK_SIZE = 1024 * 1024;                 // default plaintext bytes per chunk
+const CHUNK_SIZES = [CHUNK_SIZE, 4 * 1024 * 1024]; // large shares use 4 MiB chunks
+const CHUNK_OVERHEAD = 24 + 16;                 // header + tag (nacl or AES-GCM)
+// One request carries several chunks so a multi-gigabyte transfer isn't hundreds of
+// thousands of round trips. The slack covers per-chunk tag overhead.
+const BATCH_CAP = 8;
+const BATCH_TARGET = 16 * 1024 * 1024 + 64 * CHUNK_OVERHEAD;
+function maxBatch(chunkBody) {
+  return Math.max(1, Math.min(BATCH_CAP, Math.floor(BATCH_TARGET / chunkBody)));
+}
 const MAX_MANIFEST_BODY = 256 * 1024 * 1024;    // file list for folders with hundreds of thousands of files
 const TTL_CHOICES = [5, 15, 60, 360, 1440];     // minutes
 const UPLOAD_IDLE_MS = 10 * 60 * 1000;          // unsealed shares die after 10 idle minutes
@@ -57,7 +66,7 @@ function newId(bytes) {
   return crypto.randomBytes(bytes).toString('base64url');
 }
 
-function createShare(ttlMin, burn, live) {
+function createShare(ttlMin, burn, live, chunkSize) {
   const id = newId(16);
   const share = {
     id,
@@ -71,11 +80,13 @@ function createShare(ttlMin, burn, live) {
     expiresAt: Date.now() + UPLOAD_IDLE_MS,
     opens: 0,
     downloads: 0,
+    chunkSize,
+    chunkBody: chunkSize + CHUNK_OVERHEAD,
     // live (streamed) shares
     live: !!live,
     chunkCount: 0,
     sender: null,          // open response stream to the sender's tab
-    pending: new Map(),    // reqId -> { index, res, timer }
+    pending: new Map(),    // reqId -> { index, count, res, timer }
     orphanTimer: null,
   };
   if (share.live) share.orphanTimer = setTimeout(() => destroyShare(share), UPLOAD_IDLE_MS);
@@ -262,6 +273,31 @@ function publicInfo(share) {
   };
 }
 
+// How many chunks this request may move. Capped so one body stays around 16 MiB.
+function askedCount(share, url) {
+  let n = parseInt(url.searchParams.get('n') || '1', 10);
+  if (!Number.isInteger(n) || n < 1) n = 1;
+  return Math.min(n, maxBatch(share.chunkBody));
+}
+
+function writeAll(res, bufs) {
+  const len = bufs.reduce((s, b) => s + b.length, 0);
+  res.writeHead(200, { ...SECURITY_HEADERS, 'Content-Type': 'application/octet-stream', 'Content-Length': len });
+  return new Promise((resolve) => {
+    let i = 0;
+    const next = () => {
+      if (res.destroyed) return resolve();
+      while (i < bufs.length) {
+        if (!res.write(bufs[i++])) { res.once('drain', next); return; }
+      }
+      res.end();
+      resolve();
+    };
+    res.on('error', () => resolve());
+    next();
+  });
+}
+
 const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
@@ -300,6 +336,9 @@ async function handle(req, res) {
       const proto = USE_TLS ? 'https' : 'http';
       return send(res, 200, {
         chunkSize: CHUNK_SIZE,
+        chunkSizes: CHUNK_SIZES,
+        batchBytes: BATCH_TARGET,
+        batchCap: BATCH_CAP,
         ttlChoices: TTL_CHOICES,
         freeBytes: Math.max(0, MAX_STORE_BYTES - storedBytes),
         origins: lanAddresses().map((a) => ({ name: a.name, origin: `${proto}://${a.address}:${PORT}` })),
@@ -312,7 +351,8 @@ async function handle(req, res) {
       const need = Number(body.bytes) || 0;
       // Too big for RAM? The client streams it live instead, so this never limits file size.
       if (!body.live && need > MAX_STORE_BYTES - storedBytes) return fail(res, 507, 'Not enough free memory on the host — use live streaming');
-      const s = createShare(ttl, body.burn, body.live);
+      const chunkSize = CHUNK_SIZES.includes(body.chunkSize) ? body.chunkSize : CHUNK_SIZE;
+      const s = createShare(ttl, body.burn, body.live, chunkSize);
       return send(res, 201, { id: s.id, ownerToken: s.ownerToken });
     }
 
@@ -450,34 +490,53 @@ async function handle(req, res) {
       }
 
       // Live shares: the sender answers a block request; we pipe it straight to the recipient.
+      // `n` chunks travel in one body so a large file is a few thousand requests, not hundreds of thousands.
       if (kind === 'c' && m === 'PUT' && index !== undefined && share.live) {
         if (!isOwner(req, share)) return fail(res, 403, 'Forbidden');
-        const pend = share.pending.get(url.searchParams.get('r') || '');
-        if (!pend || pend.index !== index) { req.resume(); return fail(res, 410, 'Request no longer pending'); }
-        if (parseInt(req.headers['content-length'], 10) !== MAX_CHUNK_BODY) { req.resume(); return fail(res, 400, 'Chunks must be padded to full size'); }
-        share.pending.delete(url.searchParams.get('r'));
+        const reqId = url.searchParams.get('r') || '';
+        const pend = share.pending.get(reqId);
+        const count = askedCount(share, url);
+        if (!pend || pend.index !== index || pend.count !== count) { req.resume(); return fail(res, 410, 'Request no longer pending'); }
+        const expect = count * share.chunkBody;
+        if (parseInt(req.headers['content-length'], 10) !== expect) { req.resume(); return fail(res, 400, 'Chunks must be padded to full size'); }
+        share.pending.delete(reqId);
         clearTimeout(pend.timer);
-        pend.res.writeHead(200, { ...SECURITY_HEADERS, 'Content-Type': 'application/octet-stream', 'Content-Length': MAX_CHUNK_BODY });
+        pend.res.writeHead(200, { ...SECURITY_HEADERS, 'Content-Type': 'application/octet-stream', 'Content-Length': expect });
         pend.res.on('error', () => {});
-        req.pipe(pend.res);
-        req.on('end', () => send(res, 200, { ok: true }));
-        req.on('error', () => pend.res.destroy());
+        pipeline(req, pend.res, (err) => {
+          if (err) {
+            if (!pend.res.destroyed) pend.res.destroy();
+            if (!res.headersSent) fail(res, 400, 'Stream failed');
+            else res.destroy();
+            return;
+          }
+          if (!res.writableEnded) send(res, 200, { ok: true });
+        });
         return;
       }
 
-      // Upload a ciphertext chunk.
+      // Upload one or more ciphertext chunks (each padded to the share's chunk size).
       if (kind === 'c' && m === 'PUT' && index !== undefined) {
         if (!isOwner(req, share)) return fail(res, 403, 'Forbidden');
         if (share.sealed) return fail(res, 409, 'Share is sealed');
-        const body = await readBody(req, MAX_CHUNK_BODY);
-        if (body.length !== MAX_CHUNK_BODY) return fail(res, 400, 'Chunks must be padded to full size');
-        if (storedBytes + body.length > MAX_STORE_BYTES) return fail(res, 507, 'Host memory budget exhausted');
+        const count = askedCount(share, url);
+        if (index > 2_000_000) return fail(res, 400, 'Bad chunk');
+        const expect = count * share.chunkBody;
+        const body = await readBody(req, expect);
+        if (body.length !== expect) return fail(res, 400, 'Chunks must be padded to full size');
+        let net = body.length;
+        for (let j = 0; j < count; j++) if (share.chunks[index + j]) net -= share.chunks[index + j].length;
+        if (storedBytes + net > MAX_STORE_BYTES) return fail(res, 507, 'Host memory budget exhausted');
         if (!shares.has(share.id)) return fail(res, 404, 'Share expired');
-        const prev = share.chunks[index];
-        if (prev) { storedBytes -= prev.length; share.bytes -= prev.length; }
-        share.chunks[index] = body;
-        share.bytes += body.length;
-        storedBytes += body.length;
+        for (let j = 0; j < count; j++) {
+          const slice = Buffer.from(body.subarray(j * share.chunkBody, (j + 1) * share.chunkBody));
+          const prev = share.chunks[index + j];
+          if (prev) { storedBytes -= prev.length; share.bytes -= prev.length; prev.fill(0); }
+          share.chunks[index + j] = slice;
+          share.bytes += slice.length;
+          storedBytes += slice.length;
+        }
+        body.fill(0);
         share.expiresAt = Date.now() + UPLOAD_IDLE_MS;
         return send(res, 200, { ok: true });
       }
@@ -516,17 +575,27 @@ async function handle(req, res) {
       if (kind === 'c' && m === 'GET' && index !== undefined && share.live) {
         if (!share.sealed || index >= share.chunkCount) return fail(res, 404, 'Not found');
         if (!share.sender) return fail(res, 503, 'The sender is offline — their LocShare tab must stay open');
+        if (share.pending.size >= 8) return fail(res, 429, 'Too many block requests');
+        const count = Math.min(askedCount(share, url), share.chunkCount - index);
         const reqId = newId(9);
         const timer = setTimeout(() => { share.pending.delete(reqId); if (!res.headersSent) fail(res, 504, 'The sender did not respond'); }, LIVE_WAIT_MS);
-        share.pending.set(reqId, { index, res, timer });
+        share.pending.set(reqId, { index, count, res, timer });
         res.on('close', () => { if (share.pending.get(reqId)?.res === res) { clearTimeout(timer); share.pending.delete(reqId); } });
-        share.sender.write(`need ${reqId} ${index}\n`);
+        share.sender.write(`need ${reqId} ${index} ${count}\n`);
         return;
       }
 
       if (kind === 'c' && m === 'GET' && index !== undefined) {
-        if (!share.sealed || !share.chunks[index]) return fail(res, 404, 'Not found');
-        return send(res, 200, share.chunks[index], 'application/octet-stream');
+        if (!share.sealed || index >= share.chunks.length) return fail(res, 404, 'Not found');
+        const count = Math.min(askedCount(share, url), share.chunks.length - index);
+        const bufs = [];
+        for (let j = 0; j < count; j++) {
+          const c = share.chunks[index + j];
+          if (!c) return fail(res, 404, 'Not found');
+          bufs.push(c);
+        }
+        await writeAll(res, bufs);
+        return;
       }
 
       return fail(res, 405, 'Method not allowed');
@@ -560,6 +629,13 @@ function tlsOptions() {
 const server = USE_TLS ? https.createServer(tlsOptions(), handle) : http.createServer(handle);
 
 server.requestTimeout = 5 * 60 * 1000;
+// Keep idle sockets around between batches of a long copy. headersTimeout must stay above it.
+server.keepAliveTimeout = 60 * 1000;
+server.headersTimeout = 70 * 1000;
+server.on('connection', (socket) => {
+  socket.setNoDelay(true);
+  socket.setKeepAlive(true, 15_000);
+});
 
 server.listen(PORT, HOST, () => {
   const proto = USE_TLS ? 'https' : 'http';
