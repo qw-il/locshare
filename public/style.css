@@ -511,6 +511,25 @@ h3 small { color: var(--dim); font-weight: 450; margin-left: 6px; }
   .pair-code .dg { width: 34px; height: 50px; font-size: 25px; border-radius: 11px; }
 }
 
+/* ================================================================ folders */
+.ficon.folder { --c1: #fbbf24; --c2: #f59e0b; }
+.ficon.folder svg { width: 22px; height: 22px; fill: rgba(11, 9, 20, 0.18); stroke: #fff; stroke-width: 1.8; stroke-linejoin: round; }
+.drop-sub u { cursor: pointer; transition: color 0.25s; }
+.drop-sub u:hover { color: var(--text); }
+li.folder { list-style: none; display: flex; flex-direction: column; gap: 6px; }
+.folder-row .row-btns { display: flex; gap: 6px; align-items: center; }
+.chev-btn { width: 30px; height: 34px; border-radius: 10px; display: grid; place-items: center; color: var(--muted); transition: background 0.25s, color 0.25s; }
+.chev-btn:hover { background: rgba(255, 255, 255, 0.07); color: var(--text); }
+.chev-btn svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 2.4; stroke-linecap: round; stroke-linejoin: round; transition: transform 0.45s var(--spring); }
+li.folder.open .chev-btn svg { transform: rotate(90deg); }
+.files.sub { display: none; margin-left: 22px; padding-left: 12px; border-left: 1px dashed rgba(251, 191, 36, 0.3); max-height: 320px; overflow: auto; scrollbar-width: thin; }
+li.folder.open > .files.sub { display: flex; animation: paneIn 0.45s var(--smooth) both; }
+.files.sub .file { padding: 7px; grid-template-columns: 34px 1fr auto; }
+.files.sub .ficon { width: 34px; height: 34px; }
+.files.sub .fname { font-weight: 500; font-size: 13px; }
+.files .more { list-style: none; color: var(--dim); font-size: 12px; padding: 6px 4px; }
+.file.folder-row { grid-template-columns: 42px 1fr auto; }
+
 /* ================================================================ dialog / toasts */
 .sheet {
   width: min(480px, 100% - 32px); padding: 26px; border-radius: var(--radius); color: var(--text);

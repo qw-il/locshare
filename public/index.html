@@ -51,15 +51,16 @@
         </div>
 
         <div class="pane" data-pane="files">
-          <label class="drop" id="drop" tabindex="0">
+          <div class="drop" id="drop" tabindex="0" role="button" aria-label="Add files or a folder">
             <input type="file" id="fileInput" multiple hidden>
+            <input type="file" id="folderInput" webkitdirectory multiple hidden>
             <span class="drop-ring" aria-hidden="true"></span>
             <span class="drop-icon" aria-hidden="true">
               <svg viewBox="0 0 48 48"><path d="M24 31V13m0 0l-7 7m7-7l7 7" /><path d="M10 30v4a5 5 0 005 5h18a5 5 0 005-5v-4" /></svg>
             </span>
-            <span class="drop-title">Drop files here</span>
-            <span class="drop-sub">or <u>browse</u> · paste works too</span>
-          </label>
+            <span class="drop-title">Drop files or folders here</span>
+            <span class="drop-sub">or <u data-pick="files">browse files</u> · <u data-pick="folder">choose a folder</u></span>
+          </div>
           <ul class="files" id="fileList"></ul>
         </div>
 
@@ -219,6 +220,10 @@
             <svg viewBox="0 0 24 24"><path d="M20 11.5l-7.8 7.8a5 5 0 01-7.1-7.1l8.5-8.5a3.3 3.3 0 014.7 4.7l-8.5 8.5a1.7 1.7 0 01-2.4-2.4l7.8-7.8"/></svg>
           </button>
           <input type="file" id="roomFiles" multiple hidden>
+          <input type="file" id="roomFolder" webkitdirectory multiple hidden>
+          <button class="icon-btn" id="roomFolderBtn" title="Send a folder" aria-label="Send a folder">
+            <svg viewBox="0 0 24 24"><path d="M3 7.5A2.5 2.5 0 015.5 5h3.6l2 2.2h7.4A2.5 2.5 0 0121 9.7v7.8A2.5 2.5 0 0118.5 20h-13A2.5 2.5 0 013 17.5z"/></svg>
+          </button>
           <textarea id="roomText" rows="1" placeholder="Message, or drop files…" spellcheck="false" aria-label="Message"></textarea>
           <button class="icon-btn send" id="roomSendBtn" title="Send" aria-label="Send" disabled>
             <svg viewBox="0 0 24 24"><path d="M12 19V5m0 0l-6 6m6-6l6 6"/></svg>

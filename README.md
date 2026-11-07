@@ -38,6 +38,19 @@ Computers usually can't scan a QR code, so a session can also show a short code 
 - Each code allows exactly one attempt. A wrong guess voids it, the host is told, and a fresh code appears. A guesser therefore has a one-in-a-million chance per code shown.
 - Codes expire after 5 minutes. A used slot isn't reissued for 10 minutes, so a stale code can't collide with a new one.
 
+## Sharing folders
+
+Drag a folder in, or click **choose a folder**. Subfolders and empty folders are kept. This works for one-off links and in live sessions, and each folder shows as one row that you can expand.
+
+When receiving, **Save folder** or **Save all** writes a real folder to disk with the same structure:
+
+- **Chrome and Edge over HTTPS or `localhost`:** the browser asks where to put it, then streams each file straight into place. If a folder with that name already exists, the new copy is saved as `Name (2)` instead of overwriting it.
+- **Other browsers, or plain `http://` on the LAN:** browsers can't write folders here. You get a `.zip` that keeps the folder structure inside it.
+
+To get real folders on plain HTTP, run LocShare with HTTPS (see below).
+
+Folder and file names travel inside the encrypted manifest, so the host never sees them. Paths are sanitised on the receiving side: `..`, absolute paths, drive letters and invalid characters are stripped. A malicious sender therefore can't write outside the folder you choose.
+
 ## No file size limit
 
 There are two ways a share can travel. LocShare picks one automatically:

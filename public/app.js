@@ -65,6 +65,75 @@
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+  // A received path is untrusted: keep it strictly relative, drop "." / "..", and strip
+  // characters file systems reject, so nothing can ever be written outside the chosen folder.
+  function safeSegments(path) {
+    return String(path || '')
+      .split(/[\\/]+/)
+      .map((seg) => seg.replace(/[\x00-\x1f<>:"|?*]/g, '_').trim().slice(0, 200))
+      .filter((seg) => seg && seg !== '.' && seg !== '..')
+      .map((seg) => (/^\.+$/.test(seg) ? '_' : seg)) // all-dot names are invalid on Windows
+      .slice(-48);
+  }
+  const topOf = (path) => { const segs = safeSegments(path); return segs.length > 1 ? segs[0] : null; };
+
+  // Normalise File lists / {file, path} items into {file, path}.
+  const asItems = (list) => [...list].map((x) => (x instanceof File ? { file: x, path: x.webkitRelativePath || x.name } : x));
+
+  // Group items into top-level folders and loose files, preserving order.
+  function groupItems(items, pathOf, sizeOf) {
+    const groups = [];
+    const byTop = new Map();
+    items.forEach((it, i) => {
+      const top = topOf(pathOf(it));
+      if (!top) { groups.push({ kind: 'file', items: [it], idx: [i] }); return; }
+      let g = byTop.get(top);
+      if (!g) { g = { kind: 'folder', name: top, items: [], idx: [], size: 0 }; byTop.set(top, g); groups.push(g); }
+      g.items.push(it); g.idx.push(i); g.size += sizeOf(it);
+    });
+    return groups;
+  }
+  const describe = (groups) => {
+    const folders = groups.filter((g) => g.kind === 'folder').length;
+    const files = groups.length - folders;
+    const part = (n, w) => `${n} ${w}${n > 1 ? 's' : ''}`;
+    return [folders && part(folders, 'folder'), files && part(files, 'file')].filter(Boolean).join(' and ');
+  };
+
+  // Walk dropped folders recursively. Entries must be grabbed synchronously inside the drop event.
+  function entriesFromDrop(dt) {
+    const entries = [...(dt?.items || [])].filter((i) => i.kind === 'file').map((i) => i.webkitGetAsEntry?.()).filter(Boolean);
+    return entries.length ? entries : null;
+  }
+  async function walkEntries(entries) {
+    const items = [];
+    const dirs = [];
+    async function walk(entry, prefix) {
+      if (entry.isFile) {
+        const file = await new Promise((res, rej) => entry.file(res, rej));
+        items.push({ file, path: prefix + file.name });
+      } else if (entry.isDirectory) {
+        const reader = entry.createReader();
+        const kids = [];
+        for (;;) {
+          const batch = await new Promise((res, rej) => reader.readEntries(res, rej));
+          if (!batch.length) break;
+          kids.push(...batch);
+        }
+        const here = prefix + entry.name;
+        if (!kids.length) dirs.push(here);
+        for (const k of kids) await walk(k, here + '/');
+      }
+    }
+    for (const e of entries) await walk(e, '');
+    return { items, dirs };
+  }
+  async function droppedItems(dt) {
+    const entries = entriesFromDrop(dt);
+    if (!entries) return { items: asItems(dt?.files || []), dirs: [] };
+    return walkEntries(entries);
+  }
+
   async function pool(count, limit, worker) {
     let next = 0;
     const run = async () => { while (next < count) { const i = next++; await worker(i); } };
@@ -176,8 +245,10 @@
 
     return {
       async add(rawName, size, writeData) {
-        let name = rawName.replace(/[\\/]/g, '_') || 'file';
-        for (let i = 2; used.has(name); i++) name = rawName.replace(/(\.[^.]*)?$/, ` (${i})$1`);
+        const isDir = rawName.endsWith('/');
+        const clean = safeSegments(rawName).join('/') || 'file';
+        let name = clean + (isDir ? '/' : '');
+        for (let i = 2; used.has(name); i++) name = clean.replace(/(\.[^./]*)?$/, ` (${i})$1`) + (isDir ? '/' : '');
         used.add(name);
         const nb = enc.encode(name);
         const big = size >= MAX32;
@@ -195,7 +266,7 @@
         v.setUint32(0, 0x08074b50, true); v.setUint32(4, crc, true);
         if (big) { u64(v, 8, size); u64(v, 16, size); } else { v.setUint32(8, size, true); v.setUint32(12, size, true); }
         await put(dd);
-        files.push({ nb, size, crc, start });
+        files.push({ nb, size, crc, start, isDir });
       },
       async finish() {
         const cdStart = offset;
@@ -206,6 +277,7 @@
           c.setUint16(12, time, true); c.setUint16(14, date, true); c.setUint32(16, f.crc, true);
           c.setUint32(20, z ? MAX32 : f.size, true); c.setUint32(24, z ? MAX32 : f.size, true);
           c.setUint16(28, f.nb.length, true); c.setUint16(30, z ? 28 : 0, true); c.setUint32(42, z ? MAX32 : f.start, true);
+          if (f.isDir) c.setUint32(38, 0x10, true); // MS-DOS directory attribute
           ch.set(f.nb, 46);
           if (z) { const x = 46 + f.nb.length; c.setUint16(x, 1, true); c.setUint16(x + 2, 24, true); u64(c, x + 4, f.size); u64(c, x + 12, f.size); u64(c, x + 20, f.start); }
           await put(ch);
@@ -240,6 +312,10 @@
     { k: 'code', re: /json|javascript|xml|x-sh/, ext: /\.(js|ts|py|go|rs|c|cpp|h|java|rb|php|sh|json|html|css|md|yml|yaml|toml)$/i, c: ['#34d399', '#059669'] },
     { k: 'doc', re: /text|word|document|sheet|presentation/, ext: /\.(txt|docx?|xlsx?|pptx?|odt|csv|rtf|key|pages|numbers)$/i, c: ['#60a5fa', '#6366f1'] },
   ];
+  function folderIcon() {
+    return h('div', { class: 'ficon folder', html: '<svg viewBox="0 0 24 24"><path d="M3 7.5A2.5 2.5 0 015.5 5h3.6l2 2.2h7.4A2.5 2.5 0 0121 9.7v7.8A2.5 2.5 0 0118.5 20h-13A2.5 2.5 0 013 17.5z"/></svg>' });
+  }
+
   function kindOf(name, type) {
     return KINDS.find((k) => k.re.test(type || '') || k.ext.test(name)) || { k: 'file', c: ['#8b5cf6', '#4f46e5'] };
   }
@@ -256,6 +332,8 @@
   }
 
   const ICON = {
+    chev: '<svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>',
+    folderDl: '<svg viewBox="0 0 24 24"><path d="M3 7.5A2.5 2.5 0 015.5 5h3.6l2 2.2h7.4A2.5 2.5 0 0121 9.7v7.8A2.5 2.5 0 0118.5 20h-13A2.5 2.5 0 013 17.5z"/><path d="M12 10.5v6m0 0l-2.5-2.5M12 16.5l2.5-2.5"/></svg>',
     copy: '<svg viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="3"/><path d="M16 8V6a2 2 0 00-2-2H6a2 2 0 00-2 2v8a2 2 0 002 2h2"/></svg>',
     x: '<svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>',
     dl: '<svg viewBox="0 0 24 24"><path d="M12 4v11m0 0l-4.5-4.5M12 15l4.5-4.5"/><path d="M5 19h14"/></svg>',
@@ -369,8 +447,12 @@
   $('#burnToggle').addEventListener('change', (e) => { state.burn = e.target.checked; });
 
   // file picking
+  const folderInput = $('#folderInput');
   fileInput.addEventListener('change', () => { addFiles(fileInput.files); fileInput.value = ''; });
+  folderInput.addEventListener('change', () => { addFiles(folderInput.files); folderInput.value = ''; });
+  drop.addEventListener('click', (e) => (e.target.closest('[data-pick="folder"]') ? folderInput : fileInput).click());
   drop.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileInput.click(); } });
+  if (!('webkitdirectory' in folderInput)) $$('[data-pick="folder"]').forEach((el) => el.remove());
   let dragDepth = 0;
   const dropTarget = () => (currentView?.id === 'view-room' ? $('#roomView') : drop);
   window.addEventListener('dragenter', (e) => {
@@ -384,10 +466,15 @@
     dragDepth = 0;
     drop.classList.remove('over');
     $('#roomView').classList.remove('over');
-    if (currentView?.id === 'view-room' && e.dataTransfer?.files.length) return sendRoomFiles(e.dataTransfer.files);
-    if (currentView?.id !== 'view-send' || !e.dataTransfer?.files.length) return;
-    if (state.mode !== 'files') $('[data-mode="files"]').click();
-    addFiles(e.dataTransfer.files);
+    if (!['view-send', 'view-room'].includes(currentView?.id) || !e.dataTransfer?.files.length) return;
+    const inRoom = currentView.id === 'view-room';
+    if (!inRoom && state.mode !== 'files') $('[data-mode="files"]').click();
+    // Grab folder entries now (they expire with the event), then walk them.
+    droppedItems(e.dataTransfer).then(({ items, dirs }) => {
+      if (!items.length && !dirs.length) return;
+      if (inRoom) sendRoomFiles(items, dirs);
+      else addFiles(items, dirs);
+    }).catch((err) => toast(`Couldn’t read the dropped folder: ${err.message}`, 'err'));
   });
   window.addEventListener('paste', (e) => {
     if (currentView?.id === 'view-room' && e.clipboardData?.files.length) { e.preventDefault(); return sendRoomFiles(e.clipboardData.files); }
@@ -397,25 +484,60 @@
     addFiles(e.clipboardData.files);
   });
 
-  function addFiles(list) {
+  // state.files holds {file, path} items; state.dirs holds empty folder paths.
+  state.dirs = [];
+  function addFiles(list, dirs = []) {
     if (state.busy) return;
-    const start = state.files.length;
-    for (const f of list) {
-      if (state.files.some((x) => x.name === f.name && x.size === f.size && x.lastModified === f.lastModified)) continue;
-      state.files.push(f);
-      const thumb = kindOf(f.name, f.type).k === 'img' && f.size < 25e6 ? URL.createObjectURL(f) : null;
-      const li = h('li', { class: 'file', style: `--i:${state.files.length - 1 - start}` },
-        fileIcon(f.name, f.type, thumb),
-        h('div', { class: 'fmeta' }, h('div', { class: 'fname', title: f.name }, f.name), h('div', { class: 'fsize' }, fmtBytes(f.size))),
-        h('button', { class: 'x-btn', title: 'Remove', 'aria-label': `Remove ${f.name}`, html: ICON.x, onclick: () => removeFile(f, li, thumb) }),
-      );
+    const start = fileList.children.length;
+    const fresh = asItems(list).filter((it) => !state.files.some((x) => x.path === it.path && x.file.size === it.file.size && x.file.lastModified === it.file.lastModified));
+    for (const d of dirs) if (!state.dirs.includes(d)) state.dirs.push(d);
+    state.files.push(...fresh);
+    let n = 0;
+    for (const g of groupItems(fresh, (it) => it.path, (it) => it.file.size)) {
+      if (g.kind === 'file') {
+        const it = g.items[0];
+        const f = it.file;
+        const thumb = kindOf(f.name, f.type).k === 'img' && f.size < 25e6 ? URL.createObjectURL(f) : null;
+        const li = h('li', { class: 'file', style: `--i:${start + n++ - start}` },
+          fileIcon(f.name, f.type, thumb),
+          h('div', { class: 'fmeta' }, h('div', { class: 'fname', title: f.name }, f.name), h('div', { class: 'fsize' }, fmtBytes(f.size))),
+          h('button', { class: 'x-btn', title: 'Remove', 'aria-label': `Remove ${f.name}`, html: ICON.x, onclick: () => removeItems((x) => x === it, li, thumb) }));
+        fileList.append(li);
+      } else {
+        const existing = $(`[data-folder="${CSS.escape(g.name)}"]`, fileList);
+        if (existing) { updateFolderRow(existing, g.name); continue; }
+        const li = h('li', { class: 'file folder-row', 'data-folder': g.name, style: `--i:${n++}` },
+          folderIcon(),
+          h('div', { class: 'fmeta' }, h('div', { class: 'fname', title: g.name }, g.name), h('div', { class: 'fsize' })),
+          h('button', { class: 'x-btn', title: 'Remove folder', 'aria-label': `Remove folder ${g.name}`, html: ICON.x,
+            onclick: () => removeItems((x) => topOf(x.path) === g.name, li, null, g.name) }));
+        fileList.append(li);
+        updateFolderRow(li, g.name);
+      }
+    }
+    // Empty top-level folders (dropped on their own) get a row too.
+    for (const d of dirs) {
+      const top = safeSegments(d)[0];
+      if (!top || $(`[data-folder="${CSS.escape(top)}"]`, fileList)) continue;
+      const li = h('li', { class: 'file folder-row', 'data-folder': top, style: `--i:${n++}` },
+        folderIcon(),
+        h('div', { class: 'fmeta' }, h('div', { class: 'fname', title: top }, top), h('div', { class: 'fsize' })),
+        h('button', { class: 'x-btn', title: 'Remove folder', 'aria-label': `Remove folder ${top}`, html: ICON.x,
+          onclick: () => removeItems((x) => topOf(x.path) === top, li, null, top) }));
       fileList.append(li);
+      updateFolderRow(li, top);
     }
     refreshSummary();
   }
-  function removeFile(f, li, thumb) {
+  function updateFolderRow(li, top) {
+    const inside = state.files.filter((x) => topOf(x.path) === top);
+    const size = inside.reduce((s, x) => s + x.file.size, 0);
+    $('.fsize', li).textContent = inside.length ? `${inside.length} file${inside.length === 1 ? '' : 's'} · ${fmtBytes(size)}` : 'Empty folder';
+  }
+  function removeItems(match, li, thumb, top) {
     if (state.busy) return;
-    state.files = state.files.filter((x) => x !== f);
+    state.files = state.files.filter((x) => !match(x));
+    if (top) state.dirs = state.dirs.filter((d) => safeSegments(d)[0] !== top);
     li.classList.add('out');
     li.addEventListener('animationend', () => li.remove(), { once: true });
     if (thumb) URL.revokeObjectURL(thumb);
@@ -423,6 +545,7 @@
   }
   function clearFiles() {
     state.files = [];
+    state.dirs = [];
     $$('img', fileList).forEach((i) => URL.revokeObjectURL(i.src));
     fileList.textContent = '';
     $('#noteInput').value = '';
@@ -434,19 +557,22 @@
   function payload() {
     const note = state.mode === 'note' ? $('#noteInput').value : '';
     const files = state.mode === 'files' ? state.files : [];
-    return { files, note };
+    const dirs = state.mode === 'files' ? state.dirs : [];
+    return { files, dirs, note };
   }
   function refreshSummary() {
-    const { files, note } = payload();
-    drop.classList.toggle('compact', state.files.length > 0);
-    const total = files.reduce((s, f) => s + f.size, 0);
-    const ok = files.length > 0 || note.trim().length > 0;
+    const { files, dirs, note } = payload();
+    drop.classList.toggle('compact', state.files.length + state.dirs.length > 0);
+    const total = files.reduce((s, it) => s + it.file.size, 0);
+    const ok = files.length > 0 || dirs.length > 0 || note.trim().length > 0;
     shareBtn.disabled = !ok || state.busy;
     let msg = 'Add a file or write a note to begin.';
     if (files.length) {
       const padded = Math.ceil(total / CHUNK) * CHUNK;
-      msg = `${files.length} file${files.length > 1 ? 's' : ''} · ${fmtBytes(total)} — the host will only see ~${fmtBytes(padded || 0)} of noise`;
-      if (padded > info.freeBytes) msg = `${files.length} file${files.length > 1 ? 's' : ''} · ${fmtBytes(total)} — streams live from this tab, nothing stored on the host`;
+      const what = describe(groupItems(files, (it) => it.path, (it) => it.file.size));
+      const count = files.length > 1 && /folder/.test(what) ? ` (${files.length} files)` : '';
+      msg = `${what}${count} · ${fmtBytes(total)} — the host will only see ~${fmtBytes(padded || 0)} of noise`;
+      if (padded > info.freeBytes) msg = `${what}${count} · ${fmtBytes(total)} — streams live from this tab, nothing stored on the host`;
     } else if (note.trim()) msg = `${note.length} characters — encrypted before sending`;
     $('#summary').textContent = msg;
   }
@@ -459,14 +585,14 @@
   shareBtn.addEventListener('click', async () => {
     if (state.busy) return;
     if (typeof nacl === 'undefined') return toast('Encryption library failed to load', 'err');
-    const { files, note } = payload();
-    if (!files.length && !note.trim()) return;
+    const { files, dirs, note } = payload();
+    if (!files.length && !dirs.length && !note.trim()) return;
     state.busy = true;
     shareBtn.disabled = false;
     shareBtn.classList.add('busy');
     setProgress(shareBtn, 0, 'Generating key…');
     try {
-      const share = await createShare(files, note, (p) => setProgress(shareBtn, p, `Encrypting & sending · ${Math.round(p * 100)}%`));
+      const share = await createShare(files, note, (p) => setProgress(shareBtn, p, `Encrypting & sending · ${Math.round(p * 100)}%`), { dirs: [...dirs] });
       mine.unshift(share);
       clearFiles();
       openLinkView(share);
@@ -486,10 +612,13 @@
     const burn = opts.burn ?? state.burn;
     const key = nacl.randomBytes(32);
     const prefix = nacl.randomBytes(16);
+    const items = asItems(files);
+    files = items.map((it) => it.file);
     const entries = [];
     let total = 0;
-    for (const f of files) {
-      entries.push({ name: f.name, type: f.type, size: f.size, offset: total, modified: f.lastModified });
+    for (const it of items) {
+      const f = it.file;
+      entries.push({ name: f.name, path: it.path, type: f.type, size: f.size, offset: total, modified: f.lastModified });
       total += f.size;
     }
     const chunks = Math.ceil(total / CHUNK);
@@ -548,14 +677,14 @@
 
       const manifest = sealManifest({
         v: 1, prefix: b64u.enc(prefix), chunkSize: CHUNK, chunks, total, files: entries,
-        note: note || undefined, burn, created: Date.now(),
+        note: note || undefined, burn, created: Date.now(), dirs: opts.dirs?.length ? opts.dirs : undefined,
       }, key);
       const sealed = await (await api(`/api/s/${id}/m`, { method: 'PUT', headers: { ...auth, 'X-Chunk-Count': String(chunks) }, body: manifest })).json();
       onProgress(1);
 
-      const label = files.length
-        ? (files.length === 1 ? files[0].name : `${files[0].name} + ${files.length - 1} more`)
-        : 'Private note';
+      const groups = groupItems(items, (it) => it.path, (it) => it.file.size);
+      const first = groups[0] ? (groups[0].kind === 'folder' ? `${groups[0].name}/` : groups[0].items[0].file.name) : null;
+      const label = first ? (groups.length === 1 ? first : `${first} + ${groups.length - 1} more`) : (opts.dirs?.length ? 'Empty folder' : 'Private note');
       const share = { id, ownerToken, key: b64u.enc(key), label, expiresAt: sealed.expiresAt, ttlMs: ttl * 60e3, burn, opens: 0, downloads: 0, gone: false, live, senderOnline: false, chunks, served: 0 };
       if (live) {
         // Don't hand out the link until this tab is ready to answer block requests.
@@ -796,6 +925,9 @@
     }
   }
 
+  // Writing real folders needs the File System Access API (Chromium on HTTPS or localhost).
+  const canSaveFolders = typeof window.showDirectoryPicker === 'function';
+
   // ============================================================ share reader
   // Shared by the one-off receive page and live sessions: decrypts a share's files on demand.
 
@@ -863,30 +995,102 @@
       return r;
     }
 
-    // NB: must be called straight from a click handler — the save dialog needs the user gesture.
+    // NB: these must be called straight from a click handler — save dialogs need the user gesture.
     async function saveFile(idx, onProgress) {
       const f = files[idx];
-      if (kept.has(idx)) { saveBlob(kept.get(idx).blob, f.name); onProgress?.(1); return; }
-      const sink = await openSink(f.name, f.type);
+      const name = safeSegments(f.path || f.name).pop() || 'file';
+      if (kept.has(idx)) { saveBlob(kept.get(idx).blob, name); onProgress?.(1); return; }
+      const sink = await openSink(name, f.type);
       try { await streamFile(idx, (d) => sink.write(d), onProgress); await sink.close(); } catch (e) { sink.abort(); throw e; }
     }
 
-    async function saveAll(onProgress) {
-      if (files.length === 1) return saveFile(0, (p) => onProgress?.(p, 0, p));
-      const sink = await openSink(`locshare-${new Date().toISOString().slice(0, 10)}.zip`, 'application/zip');
+    const dirs = (manifest.dirs || []).map(String);
+    const pathOf = (idx) => files[idx].path || files[idx].name;
+
+    // Write files into a real folder on disk, recreating the directory tree (Chromium, HTTPS/localhost).
+    async function saveTree(idxs, dirList, onProgress) {
+      const root = await window.showDirectoryPicker({ id: 'locshare', mode: 'readwrite' });
+      const exists = async (name) => {
+        for (const get of ['getDirectoryHandle', 'getFileHandle']) {
+          try { await root[get](name); return true; } catch { /* not this kind */ }
+        }
+        return false;
+      };
+      // Never overwrite: a top-level name that already exists becomes "Name (2)".
+      const renamed = new Map();
+      const topName = async (name) => {
+        if (renamed.has(name)) return renamed.get(name);
+        let out = name;
+        for (let i = 2; await exists(out); i++) out = name.replace(/(\.[^.]*)?$/, ` (${i})$1`);
+        renamed.set(name, out);
+        return out;
+      };
+      const dirCache = new Map([['', root]]);
+      const dirFor = async (segs) => {
+        let key = '';
+        let handle = root;
+        for (const seg of segs) {
+          key += '/' + seg;
+          if (!dirCache.has(key)) dirCache.set(key, await handle.getDirectoryHandle(seg, { create: true }));
+          handle = dirCache.get(key);
+        }
+        return handle;
+      };
+      const mapPath = async (path) => {
+        const segs = safeSegments(path);
+        if (segs.length) segs[0] = await topName(segs[0]);
+        return segs;
+      };
+      for (const d of dirList) { const segs = await mapPath(d); if (segs.length) await dirFor(segs); }
+      const totalBytes = idxs.reduce((n, i) => n + files[i].size, 0);
+      let doneBytes = 0;
+      for (const idx of idxs) {
+        const segs = await mapPath(pathOf(idx));
+        const name = segs.pop() || 'file';
+        const dir = await dirFor(segs);
+        const w = await (await dir.getFileHandle(name, { create: true })).createWritable();
+        const size = files[idx].size;
+        try {
+          await streamFile(idx, (d) => w.write(d), (p) => onProgress?.(totalBytes ? (doneBytes + p * size) / totalBytes : 1, idx, p));
+          await w.close();
+        } catch (e) { await w.abort().catch(() => {}); throw e; }
+        doneBytes += size;
+      }
+    }
+
+    // Fallback where browsers can't write folders: one zip that keeps the folder structure.
+    async function saveZip(idxs, dirList, zipName, onProgress) {
+      const sink = await openSink(zipName, 'application/zip');
       try {
         const zip = zipWriter(sink);
+        const totalBytes = idxs.reduce((n, i) => n + files[i].size, 0);
         let doneBytes = 0;
-        for (let idx = 0; idx < files.length; idx++) {
-          const f = files[idx];
-          await zip.add(f.name, f.size, (write) => streamFile(idx, write, (p) => onProgress?.(total ? (doneBytes + p * f.size) / total : 1, idx, p), true));
-          doneBytes += f.size;
+        for (const d of dirList) await zip.add(d + '/', 0, async () => 0);
+        for (const idx of idxs) {
+          const size = files[idx].size;
+          await zip.add(pathOf(idx), size, (write) => streamFile(idx, write, (p) => onProgress?.(totalBytes ? (doneBytes + p * size) / totalBytes : 1, idx, p), true));
+          doneBytes += size;
         }
         await zip.finish();
       } catch (e) { sink.abort(); throw e; }
     }
 
-    return { id, manifest, files, total, kept, keep, saveFile, saveAll, ack: () => api(`/api/s/${id}/a`, { method: 'POST' }).catch(() => {}) };
+    const all = files.map((_, i) => i);
+    const today = () => new Date().toISOString().slice(0, 10);
+
+    function saveFolder(top, onProgress) {
+      const idxs = all.filter((i) => topOf(pathOf(i)) === top);
+      const sub = dirs.filter((d) => safeSegments(d)[0] === top);
+      return canSaveFolders ? saveTree(idxs, sub, onProgress) : saveZip(idxs, sub, `${top}.zip`, onProgress);
+    }
+
+    function saveAll(onProgress) {
+      if (files.length === 1 && !dirs.length) return saveFile(0, (p) => onProgress?.(p, 0, p));
+      return canSaveFolders ? saveTree(all, dirs, onProgress) : saveZip(all, dirs, `locshare-${today()}.zip`, onProgress);
+    }
+
+    const hasFolders = all.some((i) => topOf(pathOf(i))) || dirs.length > 0;
+    return { id, manifest, files, total, dirs, hasFolders, kept, keep, saveFile, saveFolder, saveAll, ack: () => api(`/api/s/${id}/a`, { method: 'POST' }).catch(() => {}) };
   }
 
   // One file row with a progress bar and a save button.
@@ -895,10 +1099,11 @@
     const bar = h('div', { class: 'fbar' }, h('i'));
     bar.style.display = 'none';
     const icon = fileIcon(f.name, f.type);
-    const btn = opts.button === false ? null : h('button', { class: 'dl-btn', title: 'Save', 'aria-label': `Save ${f.name}`, html: ICON.dl });
-    const li = h('li', { class: 'file', style: `--i:${idx}` },
+    const label = opts.label || f.name;
+    const btn = opts.button === false ? null : h('button', { class: 'dl-btn', title: 'Save', 'aria-label': `Save ${label}`, html: ICON.dl });
+    const li = h('li', { class: 'file', style: `--i:${opts.i ?? idx}` },
       icon,
-      h('div', { class: 'fmeta' }, h('div', { class: 'fname', title: f.name }, f.name), h('div', { class: 'fsize' }, fmtBytes(f.size)), bar),
+      h('div', { class: 'fmeta' }, h('div', { class: 'fname', title: label }, label), h('div', { class: 'fsize' }, fmtBytes(f.size)), bar),
       btn);
     const progress = (p) => { bar.style.display = ''; bar.style.setProperty('--p', p); };
     const thumb = () => {
@@ -926,6 +1131,90 @@
     if (opts.preview !== false) thumb();
     return { li, progress, icon, btn, thumb };
   }
+
+  // Render a share's contents: top-level folders collapse into one expandable row each.
+  function renderShare(reader, ul, opts = {}) {
+    const rowsByIdx = new Map();
+    const folderRows = [];
+    const groups = groupItems(reader.files, (f) => f.path || f.name, (f) => f.size);
+    // Empty top-level folders still deserve a row.
+    for (const d of reader.dirs) {
+      const top = safeSegments(d)[0];
+      if (top && !groups.some((g) => g.kind === 'folder' && g.name === top)) groups.push({ kind: 'folder', name: top, items: [], idx: [], size: 0 });
+    }
+    groups.forEach((g, gi) => {
+      if (g.kind === 'file') {
+        const row = fileRow(reader, g.idx[0], { ...opts, i: gi });
+        rowsByIdx.set(g.idx[0], row);
+        ul.append(row.li);
+        return;
+      }
+      const bar = h('div', { class: 'fbar' }, h('i'));
+      bar.style.display = 'none';
+      const sub = h('ul', { class: 'files sub' });
+      const toggle = h('button', { class: 'chev-btn', title: 'Show contents', 'aria-expanded': 'false', html: ICON.chev });
+      const btn = opts.button === false ? null : h('button', { class: 'dl-btn', title: canSaveFolders ? 'Save folder' : 'Save folder (.zip)', 'aria-label': `Save folder ${g.name}`, html: ICON.folderDl });
+      const li = h('li', { class: 'file folder-row', style: `--i:${gi}` },
+        folderIcon(),
+        h('div', { class: 'fmeta' },
+          h('div', { class: 'fname', title: g.name }, g.name),
+          h('div', { class: 'fsize' }, `${g.idx.length} file${g.idx.length === 1 ? '' : 's'} · ${fmtBytes(g.size)}`),
+          bar),
+        h('div', { class: 'row-btns' }, toggle, btn));
+      const wrap = h('li', { class: 'folder' }, li, sub);
+      let built = false;
+      toggle.addEventListener('click', () => {
+        const open = wrap.classList.toggle('open');
+        toggle.setAttribute('aria-expanded', open);
+        if (open && !built) { // build children lazily — folders can hold thousands of files
+          built = true;
+          g.idx.slice(0, 500).forEach((idx, k) => {
+            const label = safeSegments(reader.files[idx].path).slice(1).join('/');
+            const row = fileRow(reader, idx, { ...opts, label, i: Math.min(k, 12), preview: opts.preview });
+            rowsByIdx.set(idx, row);
+            sub.append(row.li);
+          });
+          if (g.idx.length > 500) sub.append(h('li', { class: 'more' }, `…and ${g.idx.length - 500} more — save the folder to get everything`));
+        }
+      });
+      const done = new Map();
+      const progress = (idx, p) => {
+        done.set(idx, p * reader.files[idx].size);
+        const sum = [...done.values()].reduce((a, b) => a + b, 0);
+        bar.style.display = '';
+        bar.style.setProperty('--p', g.size ? sum / g.size : 1);
+      };
+      g.idx.forEach((idx) => folderRows[idx] = progress);
+      if (btn) {
+        btn.addEventListener('click', async () => {
+          if (btn.disabled) return;
+          btn.disabled = true;
+          try {
+            const pending = reader.saveFolder(g.name, (frac, idx, p) => { progress(idx, p); rowsByIdx.get(idx)?.progress(p); });
+            btn.innerHTML = ICON.spin;
+            await pending;
+            bar.style.display = ''; bar.style.setProperty('--p', 1);
+            reader.ack();
+            btn.classList.add('done');
+            btn.innerHTML = ICON.ok;
+            toast(canSaveFolders ? `Saved folder “${g.name}”` : `Saved “${g.name}.zip” — this browser can’t write folders directly`, 'ok');
+          } catch (err) {
+            if (err.name !== 'AbortError') toast(err.message, 'err');
+            btn.innerHTML = ICON.folderDl;
+          } finally { btn.disabled = false; }
+        });
+      }
+      ul.append(wrap);
+    });
+    return {
+      groups,
+      progress(idx, p) { rowsByIdx.get(idx)?.progress(p); folderRows[idx]?.(idx, p); },
+      thumbs() { for (const row of rowsByIdx.values()) row.thumb(); },
+    };
+  }
+
+  const saveAllLabel = (reader) => (reader.files.length === 1 && !reader.hasFolders ? 'Save'
+    : canSaveFolders ? (reader.hasFolders ? 'Save all to a folder' : 'Save all into a folder') : 'Save all as .zip');
 
   async function copyText(text, el) {
     try { await navigator.clipboard.writeText(text); } catch {
@@ -983,7 +1272,8 @@
     lock.className = 'lock open';
 
     const fileCount = manifest.files.length;
-    title.textContent = fileCount ? `${fileCount} file${fileCount > 1 ? 's' : ''} for you` : 'A private note for you';
+    const summary = describe(groupItems(manifest.files, (f) => f.path || f.name, (f) => f.size));
+    title.textContent = fileCount ? `${summary[0].toUpperCase()}${summary.slice(1)} for you` : 'A private note for you';
     sub.textContent = manifest.burn
       ? 'This share self-destructs once saved. Make sure you’re ready.'
       : 'Decrypted locally in this browser. The host never saw any of it.';
@@ -995,11 +1285,7 @@
     }
 
     // Self-destructing shares get no per-file buttons or previews: one save, then gone.
-    const rows = manifest.files.map((_, idx) => {
-      const row = fileRow(reader, idx, { button: !manifest.burn, preview: !manifest.burn });
-      $('#recvList').append(row.li);
-      return row;
-    });
+    const view = renderShare(reader, $('#recvList'), { button: !manifest.burn, preview: !manifest.burn });
 
     $('#recvMeta').textContent = `${fileCount ? `${fmtBytes(reader.total)} · ` : ''}verified & decrypted on this device`;
 
@@ -1012,22 +1298,20 @@
     }
 
     const saveAll = $('#saveAllBtn');
-    if (fileCount > 1 || manifest.burn) {
+    if (fileCount > 1 || reader.hasFolders || manifest.burn) {
       saveAll.classList.remove('hidden');
-      $('.cta-text', saveAll).textContent = manifest.burn
-        ? (fileCount > 1 ? 'Decrypt & save all (.zip)' : 'Decrypt & save')
-        : 'Save all as .zip';
+      $('.cta-text', saveAll).textContent = manifest.burn ? `Decrypt & ${saveAllLabel(reader).toLowerCase()}` : saveAllLabel(reader);
       saveAll.onclick = async () => {
         if (saveAll.classList.contains('busy') || saveAll.disabled) return;
         try {
           const pending = reader.saveAll((frac, idx, p) => {
-            rows[idx].progress(p);
+            view.progress(idx, p);
             setProgress(saveAll, frac, `Decrypting · ${Math.round(frac * 100)}%`);
           });
           saveAll.classList.add('busy');
           await pending;
           setProgress(saveAll, 1, 'Saved');
-          toast(`Saved ${fileCount > 1 ? `${fileCount} files` : manifest.files[0].name}`, 'ok');
+          toast(`Saved ${fileCount > 1 ? summary : manifest.files[0].name}`, 'ok');
           if (manifest.burn) {
             await api(`/api/s/${id}`, { method: 'DELETE' }).catch(() => {});
             forget();
@@ -1281,28 +1565,37 @@
     } catch (err) { toast(err.message, 'err'); }
   }
 
-  async function sendRoomFiles(list) {
-    const files = [...list];
-    if (!files.length) return;
+  async function sendRoomFiles(list, dirs = []) {
+    const items = asItems(list);
+    if (!items.length && !dirs.length) return;
     if (!room.peers.size) return toast('No device connected yet — scan the QR code on another device first');
     const id = rid();
     const li = feedItem('me', id);
-    const total = files.reduce((s, f) => s + f.size, 0);
-    const ul = h('ul', { class: 'files' }, files.map((f, i) => h('li', { class: 'file', style: `--i:${i}` },
-      fileIcon(f.name, f.type, kindOf(f.name, f.type).k === 'img' && f.size < 25e6 ? URL.createObjectURL(f) : null),
-      h('div', { class: 'fmeta' }, h('div', { class: 'fname', title: f.name }, f.name), h('div', { class: 'fsize' }, fmtBytes(f.size))))));
+    const total = items.reduce((s, it) => s + it.file.size, 0);
+    const groups = groupItems(items, (it) => it.path, (it) => it.file.size);
+    const ul = h('ul', { class: 'files' }, groups.map((g, i) => {
+      if (g.kind === 'folder') {
+        return h('li', { class: 'file folder-row', style: `--i:${i}` }, folderIcon(),
+          h('div', { class: 'fmeta' }, h('div', { class: 'fname', title: g.name }, g.name), h('div', { class: 'fsize' }, `${g.idx.length} files · ${fmtBytes(g.size)}`)));
+      }
+      const f = g.items[0].file;
+      return h('li', { class: 'file', style: `--i:${i}` },
+        fileIcon(f.name, f.type, kindOf(f.name, f.type).k === 'img' && f.size < 25e6 ? URL.createObjectURL(f) : null),
+        h('div', { class: 'fmeta' }, h('div', { class: 'fname', title: f.name }, f.name), h('div', { class: 'fsize' }, fmtBytes(f.size))));
+    }));
     const bar = h('div', { class: 'fbar big' }, h('i'));
     const foot = h('div', { class: 'msg-foot' }, 'Encrypting…');
     li.append(ul, bar, foot);
     try {
-      const share = await createShare(files, '', () => {}, { live: true, ttl: 1440, burn: false });
+      const share = await createShare(items, '', () => {}, { live: true, ttl: 1440, burn: false, dirs });
       room.shares.push(share);
       share.onServe = () => {
         const p = share.chunks ? Math.min(1, share.served / share.chunks) : 1;
         bar.style.setProperty('--p', p);
         if (!li.classList.contains('delivered')) foot.textContent = p < 1 ? `Sending · ${Math.round(p * 100)}%` : 'Sent — waiting for confirmation…';
       };
-      await roomSend({ t: 'files', id, share: share.id, key: share.key, files: files.map((f) => ({ name: f.name, size: f.size, type: f.type })) });
+      // Only the share id + key travel in the message; names and paths stay inside the encrypted manifest.
+      await roomSend({ t: 'files', id, share: share.id, key: share.key });
       foot.textContent = total ? 'Sending · 0%' : 'Sent';
       if (!share.chunks) bar.style.setProperty('--p', 1);
     } catch (err) {
@@ -1327,13 +1620,14 @@
       li.classList.add('failed');
       return;
     }
-    const rows = reader.files.map((_, idx) => { const r = fileRow(reader, idx, { preview: false }); ul.append(r.li); return r; });
+    const view = renderShare(reader, ul, { preview: false });
     const n = reader.files.length;
-    if (n > 1) {
-      const btn = h('button', { class: 'ghost small' }, `Save all ${n} (.zip)`);
+    if (n > 1 && view.groups.length > 1) {
+      const label = saveAllLabel(reader);
+      const btn = h('button', { class: 'ghost small' }, label);
       btn.addEventListener('click', async () => {
         try {
-          const pending = reader.saveAll((frac, idx, p) => rows[idx].progress(p));
+          const pending = reader.saveAll((frac, idx, p) => view.progress(idx, p));
           btn.disabled = true;
           btn.textContent = 'Saving…';
           await pending;
@@ -1341,7 +1635,7 @@
           btn.textContent = 'Saved ✓';
         } catch (err) {
           if (err.name !== 'AbortError') toast(err.message, 'err');
-          btn.textContent = `Save all ${n} (.zip)`;
+          btn.textContent = label;
         } finally { btn.disabled = false; }
       });
       li.append(btn);
@@ -1358,18 +1652,20 @@
       for (let idx = 0; idx < n; idx++) {
         const size = reader.files[idx].size;
         await reader.keep(idx, (p) => {
-          rows[idx].progress(p);
+          view.progress(idx, p);
           foot.textContent = `Receiving · ${Math.round(((done + p * size) / (reader.total || 1)) * 100)}%`;
         });
         done += size;
-        rows[idx].progress(1);
-        rows[idx].thumb();
+        view.progress(idx, 1);
       }
+      view.thumbs();
       foot.textContent = `Received ${fmtBytes(reader.total)} · decrypted on this device`;
       li.classList.add('delivered');
       roomSend({ t: 'got', id: msg.id }, from).catch(() => {});
       if ($('#autoSave').checked) {
-        reader.files.forEach((f, idx) => saveBlob(reader.kept.get(idx).blob, f.name));
+        // Loose files download straight away; folders need one tap (the browser asks where to put them).
+        reader.files.forEach((f, idx) => { if (!topOf(f.path || f.name)) saveBlob(reader.kept.get(idx).blob, f.name); });
+        if (reader.hasFolders) toast('Folder received — tap its save button to choose where it goes', 'ok');
         reader.ack();
       }
     } catch (err) {
@@ -1543,6 +1839,9 @@
   $('#roomSendBtn').addEventListener('click', () => sendRoomText().then(updateSendState));
   $('#roomAttach').addEventListener('click', () => $('#roomFiles').click());
   $('#roomFiles').addEventListener('change', (e) => { sendRoomFiles(e.target.files); e.target.value = ''; });
+  $('#roomFolder').addEventListener('change', (e) => { sendRoomFiles(e.target.files); e.target.value = ''; });
+  $('#roomFolderBtn').addEventListener('click', () => $('#roomFolder').click());
+  if (!('webkitdirectory' in $('#roomFolder'))) $('#roomFolderBtn').remove();
   $('#roomInviteBtn').addEventListener('click', () => { room.inviteOpen = !room.inviteOpen; renderRoom(); });
   $('#roomLeaveBtn').addEventListener('click', leaveRoom);
   $('#roomCopy').addEventListener('click', async () => { await copyText($('#roomLink').value, $('#roomLink')); toast('Session link copied — it contains the key', 'ok'); });
