@@ -372,7 +372,7 @@
     if (total >= 32 * 1024 * 1024 && sizes.length > 1) return sizes[sizes.length - 1];
     return sizes[0];
   }
-  // Must match the server's maxBatch(): several chunks per request, about 16 MiB.
+  // Must match the server's maxBatch(): several chunks per request, about 32 MiB.
   function maxBatch(chunkBody) {
     const target = info.batchBytes || (16 * 1024 * 1024 + 64 * 40);
     const cap = info.batchCap || 8;
@@ -580,7 +580,7 @@
 
   // ============================================================ server info
   let info = {
-    chunkSize: CHUNK, chunkSizes: [CHUNK, 4 * CHUNK], batchBytes: 16 * 1024 * 1024 + 64 * 40, batchCap: 8,
+    chunkSize: CHUNK, chunkSizes: [CHUNK, 4 * CHUNK], batchBytes: 32 * 1024 * 1024 + 64 * 40, batchCap: 8,
     ttlChoices: [5, 15, 60, 360, 1440], origins: [],
   };
   const infoReady = api('/api/info').then((r) => r.json()).then((i) => { info = i; CHUNK = i.chunkSize; }).catch(() => {});
@@ -877,14 +877,26 @@
       let lo = 0;
       let hi = entries.length;
       while (lo < hi) { const mid = (lo + hi) >> 1; if (entries[mid].offset + entries[mid].size <= start) lo = mid + 1; else hi = mid; }
-      const jobs = [];
+      // Read the files in this range in order, a few at a time. Firing one read per file all
+      // at once turns a folder into random I/O and the browser serialises them anyway.
+      const spans = [];
       for (let k = lo; k < entries.length && entries[k].offset < end; k++) {
         const e = entries[k];
         const a = Math.max(start, e.offset);
         const b = Math.min(end, e.offset + e.size);
-        if (a < b) jobs.push(files[k].slice(a - e.offset, b - e.offset).arrayBuffer().then((ab) => ({ at: a - start, bytes: new Uint8Array(ab) })));
+        if (a < b) spans.push({ k, a, b });
       }
-      for (const part of await Promise.all(jobs)) {
+      const parts = new Array(spans.length);
+      let nextSpan = 0;
+      await Promise.all(Array.from({ length: Math.min(4, spans.length) }, async () => {
+        while (nextSpan < spans.length) {
+          const i = nextSpan++;
+          const { k, a, b } = spans[i];
+          const ab = await files[k].slice(a - entries[k].offset, b - entries[k].offset).arrayBuffer();
+          parts[i] = { at: a - start, bytes: new Uint8Array(ab) };
+        }
+      }));
+      for (const part of parts) {
         let pos = 0;
         while (pos < part.bytes.length) {
           const at = part.at + pos;
@@ -947,7 +959,7 @@
     share.abort = new AbortController();
     let active = 0;
     const queue = [];
-    const PARALLEL = 4;
+    const PARALLEL = 6;
     const pump = () => {
       while (active < PARALLEL && queue.length) {
         const [reqId, i, count] = queue.shift();
@@ -1378,21 +1390,14 @@
       }
     }
 
-    // Decrypt one file in order, with several batches fetched ahead of the disk write.
-    // Plaintext is handed to `write` in ~8 MiB pieces and can be dropped right after.
-    async function streamFile(idx, write, onProgress, wantCrc) {
-      const f = files[idx];
-      if (kept.has(idx)) { const k = kept.get(idx); await write(k.blob); onProgress?.(1); return k.crc; }
-      if (f.size === 0) { onProgress?.(1); return 0; }
-      const first = Math.floor(f.offset / C);
-      const n = Math.floor((f.offset + f.size - 1) / C) - first + 1;
-      const PARALLEL = 4;
+    // Fetch `n` blocks from `first`, several batches ahead of the consumer. `onPlain` is called
+    // in order and can write to disk; the next batches keep downloading while it does.
+    async function forEachChunk(first, n, onPlain, onArrive) {
+      if (n <= 0) return;
+      const PARALLEL = 6;
       const inflight = new Map();
       let scheduled = 0;
-      // How many blocks of this file have arrived, in order. Later batches can run ahead,
-      // but the estimate only counts a block once every earlier one is in too.
       const partial = new Map();
-      let written = 0;
       let shown = 0;
       const report = () => {
         let chunks = 0;
@@ -1402,10 +1407,9 @@
           chunks += b.have;
           if (b.have < b.count) break;
         }
-        if (written > chunks) chunks = written;
         if (chunks <= shown) return;
         shown = chunks;
-        onProgress?.(Math.min(1, chunks / n));
+        onArrive?.(Math.min(n, chunks));
       };
       const launch = () => {
         while (inflight.size < PARALLEL && scheduled < n) {
@@ -1414,7 +1418,8 @@
           scheduled += count;
           partial.set(k, { count, have: 0 });
           const pr = fetchRange(first + k, count, (have) => {
-            partial.set(k, { count, have });
+            const b = partial.get(k);
+            if (b) b.have = have;
             report();
           });
           pr.catch(() => {});
@@ -1422,40 +1427,143 @@
         }
       };
       launch();
-      let crc = 0;
-      const WRITE = 8 * 1024 * 1024;
-      let bin = [];
-      let binSize = 0;
-      const flush = async () => {
-        if (!binSize) return;
-        const payload = bin.length === 1 ? bin[0] : new Blob(bin);
-        bin = [];
-        binSize = 0;
-        await write(payload);
-      };
-      let doneChunks = 0;
       for (let k = 0; k < n;) {
         const job = inflight.get(k);
         inflight.delete(k);
         const plains = await job.pr;
         launch();
-        for (let j = 0; j < job.count; j++, k++) {
-          const plain = plains[j];
-          const i = first + k;
-          let part = plain.subarray(Math.max(f.offset, i * C) - i * C, Math.min(f.offset + f.size, (i + 1) * C) - i * C);
-          if (wantCrc) crc = crc32(part, crc);
-          // A view into a larger block must be copied. Some writers ignore byteOffset and would
-          // append the padding that hides the real file size.
-          if (part.byteLength && (part.byteOffset !== 0 || part.byteLength !== part.buffer.byteLength)) part = part.slice();
-          if (part.length) { bin.push(part); binSize += part.length; }
-          if (binSize >= WRITE) await flush();
-          doneChunks++;
-          written = doneChunks;
-          report();
-        }
+        for (let j = 0; j < job.count; j++, k++) await onPlain(k, plains[j]);
       }
+    }
+
+    const ownBytes = (part) => (
+      part.byteLength && (part.byteOffset !== 0 || part.byteLength !== part.buffer.byteLength) ? part.slice() : part
+    );
+
+    // Decrypt one file in order. Plaintext is handed to `write` in ~32 MiB pieces.
+    async function streamFile(idx, write, onProgress, wantCrc) {
+      const f = files[idx];
+      if (kept.has(idx)) { const k = kept.get(idx); await write(k.blob); onProgress?.(1); return k.crc; }
+      if (f.size === 0) { onProgress?.(1); return 0; }
+      const first = Math.floor(f.offset / C);
+      const n = Math.floor((f.offset + f.size - 1) / C) - first + 1;
+      let crc = 0;
+      const WRITE = 32 * 1024 * 1024;
+      let bin = [];
+      let binSize = 0;
+      const flush = async () => {
+        if (!binSize) return;
+        let payload = bin[0];
+        if (bin.length > 1) {
+          payload = new Uint8Array(binSize);
+          let o = 0;
+          for (const p of bin) { payload.set(p, o); o += p.length; }
+        }
+        bin = [];
+        binSize = 0;
+        await write(payload);
+      };
+      let doneChunks = 0;
+      await forEachChunk(first, n, async (k, plain) => {
+        const i = first + k;
+        let part = plain.subarray(Math.max(f.offset, i * C) - i * C, Math.min(f.offset + f.size, (i + 1) * C) - i * C);
+        if (wantCrc && part.length) crc = crc32(part, crc);
+        // A view into a larger block must be copied. Some writers ignore byteOffset and would
+        // append the padding that hides the real file size.
+        if (part.length) part = ownBytes(part);
+        if (part.length) { bin.push(part); binSize += part.length; }
+        if (binSize >= WRITE) await flush();
+        doneChunks++;
+        onProgress?.(doneChunks / n);
+      }, (arrived) => onProgress?.(arrived / n));
       await flush();
       return crc;
+    }
+
+    // Save many files from one forward read. Per-file saves re-download a shared block once
+    // for every file inside it, which caps a big folder far below the link speed.
+    async function streamFiles(idxs, hooks, onProgress, wantCrc) {
+      const ordered = idxs.slice().sort((a, b) => files[a].offset - files[b].offset);
+      const totalBytes = ordered.reduce((n, i) => n + files[i].size, 0) || 1;
+      let doneBytes = 0;
+      const seen = new Map();
+      const bump = (idx, fileBytes) => {
+        const prev = seen.get(idx) || 0;
+        if (fileBytes < prev) return;
+        seen.set(idx, fileBytes);
+        doneBytes += fileBytes - prev;
+        const size = files[idx].size;
+        onProgress?.(Math.min(1, doneBytes / totalBytes), idx, size ? fileBytes / size : 1);
+      };
+      const runs = [];
+      for (const idx of ordered) {
+        const f = files[idx];
+        const prev = runs.at(-1);
+        const end = f.offset + f.size;
+        if (prev && prev.end === f.offset) { prev.idxs.push(idx); prev.end = end; }
+        else runs.push({ idxs: [idx], start: f.offset, end });
+      }
+      for (const run of runs) {
+        let fi = 0;
+        let produced = 0;
+        let crc = 0;
+        const finishEmpty = async () => {
+          while (fi < run.idxs.length && files[run.idxs[fi]].size === 0) {
+            const idx = run.idxs[fi++];
+            await hooks.start(idx);
+            await hooks.end(idx, 0);
+            bump(idx, 0);
+          }
+        };
+        await finishEmpty();
+        if (fi >= run.idxs.length) continue;
+        const first = Math.floor(run.start / C);
+        const n = Math.floor((run.end - 1) / C) - first + 1;
+        await forEachChunk(first, n, async (k, plain) => {
+          const base = (first + k) * C;
+          let off = 0;
+          while (fi < run.idxs.length && off < plain.length) {
+            const idx = run.idxs[fi];
+            const f = files[idx];
+            const abs = base + off;
+            if (abs < f.offset) { off += Math.min(plain.length - off, f.offset - abs); continue; }
+            if (produced === 0 && abs === f.offset) await hooks.start(idx);
+            const take = Math.min(plain.length - off, f.size - produced);
+            if (take <= 0) {
+              await hooks.end(idx, crc);
+              bump(idx, f.size);
+              fi++;
+              produced = 0;
+              crc = 0;
+              await finishEmpty();
+              continue;
+            }
+            let part = plain.subarray(off, off + take);
+            if (wantCrc) crc = crc32(part, crc);
+            part = ownBytes(part);
+            if (part.length) await hooks.data(idx, part);
+            off += take;
+            produced += take;
+            bump(idx, produced);
+            if (produced === f.size) {
+              await hooks.end(idx, crc);
+              fi++;
+              produced = 0;
+              crc = 0;
+              await finishEmpty();
+            }
+          }
+        }, (arrived) => {
+          const idx = run.idxs[Math.min(fi, run.idxs.length - 1)];
+          const abs = Math.min(run.end, (first + arrived) * C);
+          const f = files[idx];
+          bump(idx, Math.max(0, Math.min(f.size, abs - f.offset)));
+        });
+        if (fi < run.idxs.length && produced === files[run.idxs[fi]].size) {
+          await hooks.end(run.idxs[fi], crc);
+          bump(run.idxs[fi], files[run.idxs[fi]].size);
+        }
+      }
     }
 
     // Decrypt into memory (for previews and instant saves).
@@ -1518,19 +1626,49 @@
         return segs;
       };
       for (const d of dirList) { const segs = await mapPath(d); if (segs.length) await dirFor(segs); }
-      const totalBytes = idxs.reduce((n, i) => n + files[i].size, 0);
-      let doneBytes = 0;
-      for (const idx of idxs) {
-        const segs = await mapPath(flat ? safeSegments(pathOf(idx)).pop() || 'file' : pathOf(idx));
-        const name = segs.pop() || 'file';
-        const dir = await dirFor(segs);
-        const w = await (await dir.getFileHandle(name, { create: true })).createWritable();
-        const size = files[idx].size;
-        try {
-          await streamFile(idx, (d) => w.write(d), (p) => onProgress?.(totalBytes ? (doneBytes + p * size) / totalBytes : 1, idx, p));
-          await w.close();
-        } catch (e) { await w.abort().catch(() => {}); throw e; }
-        doneBytes += size;
+      const WRITE = 32 * 1024 * 1024;
+      let w = null;
+      let bin = [];
+      let binSize = 0;
+      const flush = async () => {
+        if (!w || !binSize) return;
+        let payload = bin[0];
+        if (bin.length > 1) {
+          payload = new Uint8Array(binSize);
+          let o = 0;
+          for (const p of bin) { payload.set(p, o); o += p.length; }
+        }
+        bin = [];
+        binSize = 0;
+        await w.write(payload);
+      };
+      const closeW = async () => {
+        await flush();
+        if (!w) return;
+        const cur = w;
+        w = null;
+        await cur.close();
+      };
+      try {
+        await streamFiles(idxs, {
+          async start(idx) {
+            const segs = await mapPath(flat ? safeSegments(pathOf(idx)).pop() || 'file' : pathOf(idx));
+            const name = segs.pop() || 'file';
+            const dir = await dirFor(segs);
+            w = await (await dir.getFileHandle(name, { create: true })).createWritable();
+          },
+          async data(_idx, part) {
+            bin.push(part);
+            binSize += part.length;
+            if (binSize >= WRITE) await flush();
+          },
+          async end() { await closeW(); },
+        }, onProgress, false);
+      } catch (e) {
+        bin = [];
+        binSize = 0;
+        if (w) await w.abort().catch(() => {});
+        throw e;
       }
     }
 
@@ -1539,14 +1677,27 @@
       const sink = await openSink(zipName, 'application/zip');
       try {
         const zip = zipWriter(sink);
-        const totalBytes = idxs.reduce((n, i) => n + files[i].size, 0);
-        let doneBytes = 0;
         for (const d of dirList) await zip.add(d + '/', 0, async () => 0);
-        for (const idx of idxs) {
-          const size = files[idx].size;
-          await zip.add(pathOf(idx), size, (write) => streamFile(idx, write, (p) => onProgress?.(totalBytes ? (doneBytes + p * size) / totalBytes : 1, idx, p), true));
-          doneBytes += size;
-        }
+        let current = null;
+        await streamFiles(idxs, {
+          async start(idx) {
+            let release;
+            let finish;
+            const opened = new Promise((r) => { release = r; });
+            const ended = new Promise((r) => { finish = r; });
+            const pending = zip.add(pathOf(idx), files[idx].size, async (put) => {
+              release(put);
+              return ended;
+            });
+            current = { put: await opened, finish, pending };
+          },
+          async data(_idx, part) { await current.put(part); },
+          async end(_idx, crc) {
+            const { finish, pending } = current;
+            finish(crc);
+            await pending;
+          },
+        }, onProgress, true);
         await zip.finish();
       } catch (e) { sink.abort(); throw e; }
     }
