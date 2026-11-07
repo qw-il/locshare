@@ -97,6 +97,22 @@ On the recipient's side, files are decrypted block by block:
 
 "Save all" writes a streaming ZIP64 archive, so there is no 4 GB or file-count cap.
 
+## Speed
+
+Encryption doesn't slow LocShare down in practice. The network is almost always the limit.
+
+- **On HTTPS** (`npm run https`), file blocks use hardware-accelerated AES-256-GCM, which typically runs at hundreds of MB/s to several GB/s per core. HTTPS mode also speaks HTTP/2, so uploads and downloads aren't capped at the browser's usual six connections to one site.
+- **On plain HTTP**, blocks use XSalsa20-Poly1305 (tweetnacl), at roughly 90 MB/s per core.
+- **Either way**, encryption runs on background threads (one per CPU core). Data moves in 4 MiB blocks, with 8 in flight in each direction.
+
+For the fastest transfers:
+
+1. **Run LocShare on the sending or receiving computer itself.** If a third machine hosts it, every byte crosses the network twice.
+2. **Use Ethernet on at least one side if you can.** Typical real-world rates are 30–60 MB/s on Wi‑Fi 5 and about 110 MB/s on gigabit Ethernet.
+3. **For very large files, receive over HTTPS in Chrome or Edge.** Data then streams straight to disk.
+
+In testing on a single 4-core machine running the sender, server and receiver at once, a live transfer that was also written to disk ran at about 50–60 MiB/s. Two separate computers share less, so they should do better.
+
 ## How privacy is protected
 
 - **End-to-end encryption.** Files, file names, types, sizes and notes are encrypted in the browser with XSalsa20‑Poly1305 (NaCl `secretbox`, via [tweetnacl](https://github.com/dchest/tweetnacl-js)). A fresh random 256‑bit key is generated for every share.
