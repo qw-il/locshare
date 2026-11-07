@@ -45,18 +45,43 @@
     if (s >= 60) return `${Math.floor(s / 60)}m`;
     return `${s}s`;
   }
+  // Time remaining for a transfer. Days only show up on a very slow link.
+  function fmtEta(ms) {
+    const s = Math.max(0, Math.round(ms / 1000));
+    if (s >= 86400) {
+      const d = Math.floor(s / 86400);
+      const h = Math.floor((s % 86400) / 3600);
+      return `${d}d ${h}h left`;
+    }
+    if (s >= 3600) return `${Math.floor(s / 3600)}h${String(Math.floor((s % 3600) / 60)).padStart(2, '0')} left`;
+    if (s >= 60) return `${Math.floor(s / 60)}m left`;
+    return `${s}s left`;
+  }
   const ttlLabel = (m) => (m >= 60 ? `${m / 60}h` : `${m}m`);
 
   // Average throughput since the first bytes moved. Quiet until a transfer is actually moving.
+  // Pass the full size as `total` to also estimate how long is left at that average rate.
   function pace() {
     let t0 = 0;
-    return (bytes) => {
+    let lastBytes = 0;
+    let lastText = '';
+    return (bytes, total) => {
       if (!(bytes > 0)) return '';
       if (!t0) t0 = performance.now();
       if (bytes < 256 * 1024) return '';
       const dt = (performance.now() - t0) / 1000;
-      if (dt < 0.5) return '';
-      return `${fmtBytes(bytes / dt)}/s`;
+      if (dt < 0.5) return lastText;
+      // Same byte count means nothing new arrived. Keep the last estimate instead of
+      // stretching it just because the clock moved.
+      if (bytes <= lastBytes) return lastText;
+      lastBytes = bytes;
+      const perSec = bytes / dt;
+      const speed = `${fmtBytes(perSec)}/s`;
+      if (!(total > bytes) || perSec <= 0) { lastText = speed; return speed; }
+      const remainMs = ((total - bytes) / perSec) * 1000;
+      if (remainMs < 500) { lastText = speed; return speed; }
+      lastText = `${speed} · ${fmtEta(remainMs)}`;
+      return lastText;
     };
   }
 
@@ -1057,7 +1082,7 @@
     } else if (s.live && s.chunks && s.served > 0) {
       const p = Math.min(1, s.served / s.chunks);
       const sent = Math.min(s.plainTotal || 0, s.served * (s.chunk || CHUNK));
-      const speed = s.pace ? s.pace(sent) : '';
+      const speed = s.pace ? s.pace(sent, s.plainTotal) : '';
       if (p >= 1) {
         title.textContent = 'Delivered';
         sub.textContent = 'The recipient has the data. Keep this tab open until their save finishes.';
@@ -1304,7 +1329,7 @@
     const batchN = maxBatch(C + 40);
 
     // Pull `count` ciphertext blocks in one response and decrypt each as it arrives.
-    async function fetchRange(start, count) {
+    async function fetchRange(start, count, onChunk) {
       if (cipher === 'aes-256-gcm' && !(globalThis.crypto && crypto.subtle)) {
         throw Object.assign(new Error('This transfer uses AES-GCM. Open the https:// address of this LocShare to receive it.'), { fatal: true });
       }
@@ -1335,6 +1360,7 @@
                     () => { throw Object.assign(new Error('Integrity check failed — data was tampered with'), { fatal: true }); },
                   );
                   got++;
+                  onChunk?.(got);
                   frame = new Uint8Array(size);
                   filled = 0;
                 }
@@ -1363,12 +1389,34 @@
       const PARALLEL = 4;
       const inflight = new Map();
       let scheduled = 0;
+      // How many blocks of this file have arrived, in order. Later batches can run ahead,
+      // but the estimate only counts a block once every earlier one is in too.
+      const partial = new Map();
+      let written = 0;
+      let shown = 0;
+      const report = () => {
+        let chunks = 0;
+        for (;;) {
+          const b = partial.get(chunks);
+          if (!b?.have) break;
+          chunks += b.have;
+          if (b.have < b.count) break;
+        }
+        if (written > chunks) chunks = written;
+        if (chunks <= shown) return;
+        shown = chunks;
+        onProgress?.(Math.min(1, chunks / n));
+      };
       const launch = () => {
         while (inflight.size < PARALLEL && scheduled < n) {
           const k = scheduled;
           const count = Math.min(batchN, n - k);
           scheduled += count;
-          const pr = fetchRange(first + k, count);
+          partial.set(k, { count, have: 0 });
+          const pr = fetchRange(first + k, count, (have) => {
+            partial.set(k, { count, have });
+            report();
+          });
           pr.catch(() => {});
           inflight.set(k, { count, pr });
         }
@@ -1402,7 +1450,8 @@
           if (part.length) { bin.push(part); binSize += part.length; }
           if (binSize >= WRITE) await flush();
           doneChunks++;
-          onProgress?.(doneChunks / n);
+          written = doneChunks;
+          report();
         }
       }
       await flush();
@@ -1541,8 +1590,8 @@
     const progress = (p) => {
       bar.style.display = '';
       bar.style.setProperty('--p', p);
-      if (f.size >= 8 * 1024 * 1024 && p > 0) {
-        const speed = rate(p * f.size);
+      if (p > 0 && f.size > 0) {
+        const speed = rate(p * f.size, f.size);
         sizeEl.textContent = `${Math.round(p * 100)}%${speed ? ` · ${speed}` : ''} · ${fmtBytes(f.size)}`;
       }
     };
@@ -1595,11 +1644,14 @@
       const sub = h('ul', { class: 'files sub' });
       const toggle = h('button', { class: 'chev-btn', title: 'Show contents', 'aria-expanded': 'false', html: ICON.chev });
       const btn = opts.button === false ? null : h('button', { class: 'dl-btn', title: canSaveFolders ? 'Save folder' : 'Save folder (.zip)', 'aria-label': `Save folder ${g.name}`, html: ICON.folderDl });
+      const countLabel = `${g.idx.length} file${g.idx.length === 1 ? '' : 's'} · ${fmtBytes(g.size)}`;
+      const sizeEl = h('div', { class: 'fsize' }, countLabel);
+      const rate = pace();
       const li = h('li', { class: 'file folder-row', style: `--i:${gi}` },
         folderIcon(),
         h('div', { class: 'fmeta' },
           h('div', { class: 'fname', title: g.name }, g.name),
-          h('div', { class: 'fsize' }, `${g.idx.length} file${g.idx.length === 1 ? '' : 's'} · ${fmtBytes(g.size)}`),
+          sizeEl,
           bar),
         h('div', { class: 'row-btns' }, toggle, btn));
       const wrap = h('li', { class: 'folder' }, li, sub);
@@ -1624,8 +1676,14 @@
         const now = p * reader.files[idx].size;
         sum += now - (done.get(idx) || 0);
         done.set(idx, now);
+        const frac = g.size ? Math.min(1, sum / g.size) : 1;
         bar.style.display = '';
-        bar.style.setProperty('--p', g.size ? Math.min(1, sum / g.size) : 1);
+        bar.style.setProperty('--p', frac);
+        if (frac >= 1) sizeEl.textContent = countLabel;
+        else {
+          const speed = rate(sum, g.size);
+          sizeEl.textContent = `${Math.round(frac * 100)}%${speed ? ` · ${speed}` : ''} · ${fmtBytes(g.size)}`;
+        }
       };
       g.idx.forEach((idx) => folderRows[idx] = progress);
       if (btn) {
@@ -1767,7 +1825,7 @@
         try {
           const pending = reader.saveAll((frac, idx, p) => {
             view.progress(idx, p);
-            const speed = rate(frac * reader.total);
+            const speed = rate(frac * reader.total, reader.total);
             setProgress(saveAll, frac, `Saving · ${Math.round(frac * 100)}%${speed ? ` · ${speed}` : ''}`);
           });
           saveAll.classList.add('busy');
@@ -2056,7 +2114,7 @@
         prevServe?.();
         const p = share.chunks ? Math.min(1, share.served / share.chunks) : 1;
         const sent = Math.min(total, share.served * (share.chunk || CHUNK));
-        const speed = share.pace ? share.pace(sent) : '';
+        const speed = share.pace ? share.pace(sent, total) : '';
         bar.style.setProperty('--p', p);
         if (!li.classList.contains('delivered')) {
           foot.textContent = p < 1
@@ -2096,9 +2154,14 @@
       let label = saveAllLabel(reader);
       const btn = h('button', { class: 'ghost small' }, label);
       saveLabels.add(() => { if (!btn.disabled && !/Saved|Saving/.test(btn.textContent)) btn.textContent = label = saveAllLabel(reader); });
+      const rate = pace();
       btn.addEventListener('click', async () => {
         try {
-          const pending = reader.saveAll((frac, idx, p) => view.progress(idx, p));
+          const pending = reader.saveAll((frac, idx, p) => {
+            view.progress(idx, p);
+            const speed = rate(frac * reader.total, reader.total);
+            btn.textContent = `Saving · ${Math.round(frac * 100)}%${speed ? ` · ${speed}` : ''}`;
+          });
           btn.disabled = true;
           btn.textContent = 'Saving…';
           await pending;
@@ -2122,11 +2185,14 @@
     // Small enough: pull and decrypt right away so it's ready the instant it lands.
     try {
       let done = 0;
+      const rate = pace();
       for (let idx = 0; idx < n; idx++) {
         const size = reader.files[idx].size;
         await reader.keep(idx, (p) => {
           view.progress(idx, p);
-          foot.textContent = `Receiving · ${Math.round(((done + p * size) / (reader.total || 1)) * 100)}%`;
+          const got = done + p * size;
+          const speed = rate(got, reader.total);
+          foot.textContent = `Receiving · ${Math.round((got / (reader.total || 1)) * 100)}%${speed ? ` · ${speed}` : ''}`;
         });
         done += size;
         view.progress(idx, 1);
