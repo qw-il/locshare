@@ -78,6 +78,10 @@
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+  // Chrome uploads Blob bodies ~10-20x faster than ArrayBuffer/typed-array bodies (measured:
+  // ~24 MiB/s vs 240-460 MiB/s for 4 MiB blocks), so every upload is wrapped in a Blob.
+  const asUpload = (bytes) => new Blob([bytes], { type: 'application/octet-stream' });
+
   // A received path is untrusted: keep it strictly relative, drop "." / "..", and strip
   // characters file systems reject, so nothing can ever be written outside the chosen folder.
   function safeSegments(path) {
@@ -219,12 +223,93 @@
   }
 
   // ============================================================ crypto
-  // File blocks are sealed off the main thread, one worker per core.
-  // HTTPS pages use AES-256-GCM (hardware). Plain HTTP, where WebCrypto is unavailable, uses
-  // XSalsa20-Poly1305. Notes, manifests and room messages stay on NaCl here — they're tiny and
-  // their nonce is random, not derived from a block index.
+  // File blocks: hardware AES-256-GCM on HTTPS (its own subkey, so the share key is never used by
+  // two algorithms), XSalsa20-Poly1305 on plain HTTP. Manifests, session messages and pairing
+  // always use tweetnacl, with a random nonce rather than a block index.
   const NONCE = 24;
   let CHUNK = 1024 * 1024;
+  const CIPHER = location.protocol === 'https:' && globalThis.crypto?.subtle ? 'aes-256-gcm' : 'xsalsa20poly1305';
+  // AES gets its own subkey, derived from the share key, so one key is never used by two algorithms.
+  const blockKey = (cipher, key) => (cipher === 'aes-256-gcm'
+    ? nacl.hash(new Uint8Array([...new TextEncoder().encode('LocShare/aes-256-gcm/blocks/v1'), ...key])).slice(0, 32)
+    : key);
+
+  // Seal/open file blocks on background threads (one per core) so transfers use several cores and
+  // the page stays smooth. Falls back to this thread if workers can't start.
+  const cryptoPool = (() => {
+    const size = Math.max(2, Math.min(navigator.hardwareConcurrency || 4, 8));
+    const pending = new Map();
+    let workers = null;
+    let next = 0;
+    let seq = 0;
+
+    async function inline(m) {
+      const data = new Uint8Array(m.data);
+      if (m.cipher === 'aes-256-gcm') {
+        const iv = new Uint8Array(12);
+        iv.set(m.prefix.subarray(0, 4), 0);
+        new DataView(iv.buffer).setBigUint64(4, BigInt(m.index));
+        const key = await crypto.subtle.importKey('raw', m.key, 'AES-GCM', false, ['encrypt', 'decrypt']);
+        if (m.op === 'seal') {
+          const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, data));
+          const out = new Uint8Array(NONCE + ct.length);
+          out.set(iv, 0);
+          out.set(ct, NONCE);
+          return out;
+        }
+        try { return new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, data.subarray(NONCE))); }
+        catch { throw new Error('tamper'); }
+      }
+      const nonce = chunkNonce(m.prefix, m.index);
+      if (m.op === 'seal') return seal(data, nonce, m.key);
+      const plain = nacl.secretbox.open(data.subarray(NONCE), nonce, m.key);
+      if (!plain) throw new Error('tamper');
+      return plain;
+    }
+
+    function start() {
+      if (workers) return workers;
+      workers = [];
+      if (typeof Worker !== 'function') return workers;
+      try {
+        for (let i = 0; i < size; i++) {
+          const w = new Worker('/crypto-worker.js');
+          w.onmessage = ({ data }) => {
+            const p = pending.get(data.id);
+            if (!p) return;
+            pending.delete(data.id);
+            if (data.error) p.reject(new Error(data.error));
+            else p.resolve(new Uint8Array(data.out, data.off, data.len));
+          };
+          // If a worker dies, finish its jobs here and stop using workers.
+          w.onerror = (e) => {
+            e.preventDefault?.();
+            workers.forEach((x) => x.terminate());
+            workers.length = 0;
+            for (const [id, p] of pending) if (p.worker === w) { pending.delete(id); inline(p.msg).then(p.resolve, p.reject); }
+          };
+          workers.push(w);
+        }
+      } catch { workers.length = 0; }
+      return workers;
+    }
+
+    function run(op, cipher, key, prefix, index, bytes) {
+      // Hand over a standalone buffer (transferred, not copied).
+      const buf = bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength ? bytes.buffer : bytes.slice().buffer;
+      const msg = { op, cipher, key, prefix, index, data: buf };
+      const ws = start();
+      if (!ws.length) return inline(msg);
+      return new Promise((resolve, reject) => {
+        const id = ++seq;
+        const w = ws[next++ % ws.length];
+        // Keep a copy of the input for the inline fallback only while workers might still fail.
+        pending.set(id, { resolve, reject, worker: w, msg: { ...msg, data: buf.slice(0) } });
+        w.postMessage({ id, ...msg }, [buf]);
+      });
+    }
+    return { seal: (...a) => run('seal', ...a), open: (...a) => run('open', ...a) };
+  })();
 
   function chunkNonce(prefix, index) {
     const n = new Uint8Array(NONCE);
@@ -256,132 +341,6 @@
     const len = new DataView(plain.buffer, plain.byteOffset).getUint32(0);
     return JSON.parse(new TextDecoder().decode(plain.subarray(4, 4 + len)));
   }
-
-  function makeSemaphore(max) {
-    let used = 0;
-    const q = [];
-    return {
-      acquire() {
-        if (used < max) { used++; return Promise.resolve(); }
-        return new Promise((resolve) => q.push(resolve));
-      },
-      release() {
-        const next = q.shift();
-        if (next) next();
-        else used--;
-      },
-    };
-  }
-
-  // File-block cipher. The same key bytes feed either algorithm; the manifest records which.
-  const blocks = (() => {
-    const useAes = location.protocol === 'https:' && !!(globalThis.crypto && crypto.subtle);
-    const cipher = useAes ? 'aes-256-gcm' : 'xsalsa20poly1305';
-    const cores = Math.min(4, navigator.hardwareConcurrency || 2);
-    const slots = makeSemaphore(cores * 2);
-    const workers = [];
-    const pending = new Map();
-    let seq = 0;
-    let rr = 0;
-    let broken = false;
-
-    function failWorker(w, err) {
-      for (const [id, job] of pending) {
-        if (job.w === w) { pending.delete(id); job.reject(err); }
-      }
-    }
-    try {
-      for (let i = 0; i < cores; i++) {
-        const w = new Worker('/crypto-worker.js');
-        w.onmessage = (e) => {
-          const job = pending.get(e.data.id);
-          if (!job) return;
-          pending.delete(e.data.id);
-          if (e.data.error) {
-            const error = new Error(e.data.error === 'tamper' ? 'Integrity check failed — data was tampered with' : e.data.error);
-            if (e.data.error === 'tamper') error.fatal = true;
-            job.reject(error);
-          } else job.resolve(new Uint8Array(e.data.out, e.data.off || 0, e.data.len));
-        };
-        w.onerror = () => { broken = true; failWorker(w, new Error('Encryption worker failed')); };
-        workers.push(w);
-      }
-    } catch { broken = true; }
-
-    const aesKeys = new WeakMap();
-    function aesIv(prefix, index) {
-      const iv = new Uint8Array(12);
-      iv.set(prefix.subarray(0, 4), 0);
-      new DataView(iv.buffer).setBigUint64(4, BigInt(index));
-      return iv;
-    }
-    async function aesKey(raw) {
-      let p = aesKeys.get(raw);
-      if (!p) {
-        p = crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
-        aesKeys.set(raw, p);
-      }
-      return p;
-    }
-    async function localRun(op, data, index, key, prefix, which) {
-      if (which === 'aes-256-gcm') {
-        const iv = aesIv(prefix, index);
-        const k = await aesKey(key);
-        if (op === 'seal') {
-          const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, k, data));
-          data.fill(0);
-          const out = new Uint8Array(NONCE + ct.length);
-          out.set(iv, 0);
-          out.set(ct, NONCE);
-          return out;
-        }
-        try {
-          return new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, k, data.subarray(NONCE)));
-        } catch {
-          throw Object.assign(new Error('Integrity check failed — data was tampered with'), { fatal: true });
-        }
-      }
-      if (op === 'seal') {
-        const out = seal(data, chunkNonce(prefix, index), key);
-        data.fill(0);
-        return out;
-      }
-      const plain = nacl.secretbox.open(data.subarray(NONCE), chunkNonce(prefix, index), key);
-      if (!plain) throw Object.assign(new Error('Integrity check failed — data was tampered with'), { fatal: true });
-      return plain;
-    }
-    function call(op, bytes, index, key, prefix, which) {
-      if (broken || !workers.length) return localRun(op, bytes, index, key, prefix, which);
-      const w = workers[rr++ % workers.length];
-      const id = ++seq;
-      return new Promise((resolve, reject) => {
-        pending.set(id, { resolve, reject, w });
-        try {
-          const msg = { id, op, cipher: which, index, key, prefix };
-          if (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength) {
-            msg.data = bytes.buffer;
-            w.postMessage(msg, [bytes.buffer]);
-          } else {
-            msg.data = bytes;
-            w.postMessage(msg);
-          }
-        } catch (err) {
-          pending.delete(id);
-          reject(err);
-        }
-      });
-    }
-    async function run(op, bytes, index, key, prefix, which) {
-      await slots.acquire();
-      try { return await call(op, bytes, index, key, prefix, which); }
-      finally { slots.release(); }
-    }
-    return {
-      cipher,
-      seal: (plain, index, key, prefix) => run('seal', plain, index, key, prefix, cipher),
-      open: (boxed, index, key, prefix, which) => run('open', boxed, index, key, prefix, which || cipher),
-    };
-  })();
 
   function chooseChunk(total) {
     const sizes = (info.chunkSizes?.length ? info.chunkSizes : [info.chunkSize || CHUNK]).slice().sort((a, b) => a - b);
@@ -844,6 +803,7 @@
     const burn = opts.burn ?? state.burn;
     const key = nacl.randomBytes(32);
     const prefix = nacl.randomBytes(16);
+    const bkey = blockKey(CIPHER, key);
     const items = asItems(files);
     files = items.map((it) => it.file);
     const entries = [];
@@ -913,7 +873,7 @@
     }
     async function sealChunks(start, count) {
       const plains = await readSequential(() => readChunks(start, count));
-      return Promise.all(plains.map((plain, k) => blocks.seal(plain, start + k, key, prefix)));
+      return Promise.all(plains.map((plain, k) => cryptoPool.seal(CIPHER, bkey, prefix, start + k, plain)));
     }
 
     let done = 0;
@@ -929,10 +889,10 @@
       });
 
       const manifest = sealManifest({
-        v: 1, cipher: blocks.cipher, prefix: b64u.enc(prefix), chunkSize: chunk, chunks, total, files: entries,
+        v: 2, cipher: CIPHER, prefix: b64u.enc(prefix), chunkSize: chunk, chunks, total, files: entries,
         note: note || undefined, burn, created: Date.now(), dirs: opts.dirs?.length ? opts.dirs : undefined,
       }, key);
-      const sealed = await (await api(`/api/s/${id}/m`, { method: 'PUT', headers: { ...auth, 'X-Chunk-Count': String(chunks) }, body: manifest })).json();
+      const sealed = await (await api(`/api/s/${id}/m`, { method: 'PUT', headers: { ...auth, 'X-Chunk-Count': String(chunks) }, body: asUpload(manifest) })).json();
       onProgress(1);
 
       const groups = groupItems(items, (it) => it.path, (it) => it.file.size);
@@ -1335,7 +1295,9 @@
   function makeReader(id, key, manifest) {
     const prefix = b64u.dec(manifest.prefix);
     const C = manifest.chunkSize;
-    const cipher = manifest.cipher === 'aes-256-gcm' ? 'aes-256-gcm' : 'xsalsa20poly1305';
+    const cipher = manifest.cipher || 'xsalsa20poly1305';
+    if (cipher === 'aes-256-gcm' && !globalThis.crypto?.subtle) throw new Error('This share needs a secure (https://) page to open');
+    const bkey = blockKey(cipher, key);
     const files = manifest.files;
     const total = files.reduce((s, f) => s + f.size, 0);
     const kept = new Map(); // idx -> { blob, crc }: decrypted copies held in memory
@@ -1366,7 +1328,12 @@
                 off += n;
                 if (filled === size) {
                   if (got >= count) throw Object.assign(new Error('Unexpected extra data'), { fatal: true });
-                  openings[got] = blocks.open(frame, start + got, key, prefix, cipher);
+                  // The nonce is recomputed from the index we asked for — blocks can't be swapped.
+                  const index = start + got;
+                  openings[got] = cryptoPool.open(cipher, bkey, prefix, index, frame).then(
+                    (plain) => plain,
+                    () => { throw Object.assign(new Error('Integrity check failed — data was tampered with'), { fatal: true }); },
+                  );
                   got++;
                   frame = new Uint8Array(size);
                   filled = 0;
@@ -1750,7 +1717,9 @@
     }
     if (!manifest) return failWith('Wrong key', 'The link’s key doesn’t match this share. Nothing could be decrypted.');
 
-    const reader = makeReader(id, key, manifest);
+    let reader;
+    try { reader = makeReader(id, key, manifest); }
+    catch (err) { return failWith('Can’t open this share', err.message); }
     await sleep(450); // let the unlock animation breathe
     lock.className = 'lock open';
 

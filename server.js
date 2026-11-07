@@ -18,7 +18,7 @@
 'use strict';
 
 const http = require('http');
-const https = require('https');
+const http2 = require('http2');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -36,7 +36,7 @@ const AUTO_TLS = !TLS_CERT && (process.argv.includes('--https') || /^(1|true|yes
 const USE_TLS = !!(TLS_CERT && TLS_KEY) || AUTO_TLS;
 
 const CHUNK_SIZE = 1024 * 1024;                 // default plaintext bytes per chunk
-const CHUNK_SIZES = [CHUNK_SIZE, 4 * 1024 * 1024]; // large shares use 4 MiB chunks
+const CHUNK_SIZES = [CHUNK_SIZE, 4 * 1024 * 1024]; // shares of 32 MiB and up use 4 MiB chunks
 const CHUNK_OVERHEAD = 24 + 16;                 // header + tag (nacl or AES-GCM)
 // One request carries several chunks so a multi-gigabyte transfer isn't hundreds of
 // thousands of round trips. The slack covers per-chunk tag overhead.
@@ -214,6 +214,7 @@ const SECURITY_HEADERS = {
   'Content-Security-Policy': [
     "default-src 'none'",
     "script-src 'self'",
+    "worker-src 'self'",
     "style-src 'self'",
     "img-src 'self' data: blob:",
     "connect-src 'self'",
@@ -626,7 +627,19 @@ function tlsOptions() {
   tlsInfo = require('./tls').selfSigned(lanAddresses().map((a) => a.address), path.join(__dirname, '.locshare'));
   return { cert: tlsInfo.cert, key: tlsInfo.key };
 }
-const server = USE_TLS ? https.createServer(tlsOptions(), handle) : http.createServer(handle);
+// Over TLS, speak HTTP/2: every request shares one connection, so browsers aren't capped at six
+// parallel requests, and big flow-control windows keep a fast LAN saturated. HTTP/1.1 still works.
+const server = USE_TLS
+  ? http2.createSecureServer({
+    ...tlsOptions(),
+    allowHTTP1: true,
+    settings: { initialWindowSize: 16 * 1024 * 1024 },
+    // Node's default 10 MB per-connection budget refuses streams once a few 4 MiB blocks are in
+    // flight; allow plenty so parallel uploads and downloads never get reset.
+    maxSessionMemory: 1024,
+  }, handle)
+  : http.createServer(handle);
+if (USE_TLS) server.on('session', (session) => { try { session.setLocalWindowSize(64 * 1024 * 1024); } catch { /* older Node */ } });
 
 server.requestTimeout = 5 * 60 * 1000;
 // Keep idle sockets around between batches of a long copy. headersTimeout must stay above it.
