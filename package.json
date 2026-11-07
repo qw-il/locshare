@@ -4,7 +4,8 @@
   "description": "Private, end-to-end encrypted file sharing over your local network",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "https": "node server.js --https"
   },
   "repository": {
     "type": "git",

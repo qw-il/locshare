@@ -29,6 +29,9 @@ const HOST = process.env.HOST || '0.0.0.0';
 const MAX_STORE_BYTES = parseInt(process.env.MAX_STORE_MB || '2048', 10) * 1024 * 1024;
 const TLS_CERT = process.env.TLS_CERT;
 const TLS_KEY = process.env.TLS_KEY;
+// `npm run https` / HTTPS=1: serve over HTTPS with an auto-generated self-signed certificate.
+const AUTO_TLS = !TLS_CERT && (process.argv.includes('--https') || /^(1|true|yes)$/i.test(process.env.HTTPS || ''));
+const USE_TLS = !!(TLS_CERT && TLS_KEY) || AUTO_TLS;
 
 const CHUNK_SIZE = 1024 * 1024;                 // plaintext bytes per chunk (must match client)
 const CHUNK_OVERHEAD = 24 + 16;                 // nonce + Poly1305 tag
@@ -217,7 +220,7 @@ const SECURITY_HEADERS = {
 };
 
 function send(res, status, body, type = 'application/json') {
-  if (TLS_CERT) res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+  if (USE_TLS) res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
   const data = typeof body === 'string' || Buffer.isBuffer(body) ? body : JSON.stringify(body);
   res.writeHead(status, { ...SECURITY_HEADERS, 'Content-Type': type, 'Content-Length': Buffer.byteLength(data) });
   res.end(data);
@@ -294,7 +297,7 @@ async function handle(req, res) {
   try {
     // ---- API -------------------------------------------------------------
     if (p === '/api/info' && m === 'GET') {
-      const proto = TLS_CERT ? 'https' : 'http';
+      const proto = USE_TLS ? 'https' : 'http';
       return send(res, 200, {
         chunkSize: CHUNK_SIZE,
         ttlChoices: TTL_CHOICES,
@@ -548,19 +551,30 @@ async function handle(req, res) {
 }
 
 // ---------------------------------------------------------------- start
-const server = TLS_CERT && TLS_KEY
-  ? https.createServer({ cert: fs.readFileSync(TLS_CERT), key: fs.readFileSync(TLS_KEY) }, handle)
-  : http.createServer(handle);
+let tlsInfo = null;
+function tlsOptions() {
+  if (TLS_CERT && TLS_KEY) return { cert: fs.readFileSync(TLS_CERT), key: fs.readFileSync(TLS_KEY) };
+  tlsInfo = require('./tls').selfSigned(lanAddresses().map((a) => a.address), path.join(__dirname, '.locshare'));
+  return { cert: tlsInfo.cert, key: tlsInfo.key };
+}
+const server = USE_TLS ? https.createServer(tlsOptions(), handle) : http.createServer(handle);
 
 server.requestTimeout = 5 * 60 * 1000;
 
 server.listen(PORT, HOST, () => {
-  const proto = TLS_CERT ? 'https' : 'http';
+  const proto = USE_TLS ? 'https' : 'http';
   const c = (s, n) => (process.stdout.isTTY ? `\x1b[${n}m${s}\x1b[0m` : s);
   console.log(`\n  ${c('LocShare', '1;35')}  ${c('private file sharing on your network', '2')}\n`);
   console.log(`  ${c('Local:', '2')}    ${proto}://localhost:${PORT}`);
   for (const a of lanAddresses()) console.log(`  ${c('Network:', '2')}  ${c(`${proto}://${a.address}:${PORT}`, '36')}  ${c(a.name, '2')}`);
   console.log(`\n  ${c('End-to-end encrypted · RAM only · no logs', '2')}\n`);
+  if (tlsInfo) {
+    console.log(`  ${c('HTTPS with a self-signed certificate', '33')}${tlsInfo.created ? ' (new)' : ''}. Browsers will warn once per device —`);
+    console.log(`  choose ${c('Advanced → Proceed', '1')} after checking this fingerprint matches the one in the warning:`);
+    console.log(`  ${c(tlsInfo.fingerprint, '2')}\n`);
+  } else if (!USE_TLS) {
+    console.log(`  ${c('Tip:', '2')} run ${c('npm run https', '1')} to let browsers save straight into folders you choose.\n`);
+  }
 });
 
 function shutdown() {

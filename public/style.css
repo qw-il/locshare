@@ -530,6 +530,30 @@ li.folder.open > .files.sub { display: flex; animation: paneIn 0.45s var(--smoot
 .files .more { list-style: none; color: var(--dim); font-size: 12px; padding: 6px 4px; }
 .file.folder-row { grid-template-columns: 42px 1fr auto; }
 
+/* ================================================================ save location */
+.save-loc {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px 12px; margin: 4px 0 12px; padding: 10px 10px 10px 12px;
+  border-radius: 16px; background: rgba(255, 255, 255, 0.035); border: 1px solid var(--line); text-align: left;
+  transition: border-color 0.4s, background 0.4s;
+}
+.save-loc:empty { display: none; }
+.save-loc.set { border-color: rgba(251, 191, 36, 0.28); background: rgba(251, 191, 36, 0.05); }
+.room-card .save-loc { margin: 12px 0 0; }
+.sl-ico { flex: none; width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center; background: linear-gradient(135deg, #fbbf24, #f59e0b); box-shadow: 0 6px 16px -8px #f59e0b; }
+.sl-ico svg { width: 18px; height: 18px; fill: rgba(11, 9, 20, 0.18); stroke: #fff; stroke-width: 1.8; stroke-linejoin: round; }
+.sl-text { flex: 1; min-width: 140px; display: flex; flex-direction: column; line-height: 1.3; }
+.sl-text small { color: var(--dim); font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600; }
+.sl-text b { font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; animation: fadeIn 0.4s both; }
+.sl-text em { font-style: normal; color: #fcd34d; font-size: 12px; }
+.sl-actions { display: flex; gap: 6px; align-items: center; }
+.sl-help { display: none; flex-basis: 100%; font-size: 12.5px; color: var(--muted); padding: 2px 4px 2px 46px; }
+.save-loc.help-open .sl-help { display: block; animation: paneIn 0.4s var(--smooth) both; }
+.sl-help p { margin: 0 0 6px; }
+.sl-help ul { margin: 0; padding-left: 16px; display: flex; flex-direction: column; gap: 6px; }
+.sl-help b { color: var(--text); font-weight: 600; }
+.sl-help code { font-family: var(--mono); color: #ddd6fe; background: rgba(167, 139, 250, 0.12); padding: 1px 5px; border-radius: 5px; }
+@media (max-width: 520px) { .sl-help { padding-left: 4px; } }
+
 /* ================================================================ dialog / toasts */
 .sheet {
   width: min(480px, 100% - 32px); padding: 26px; border-radius: var(--radius); color: var(--text);

@@ -928,6 +928,122 @@
   // Writing real folders needs the File System Access API (Chromium on HTTPS or localhost).
   const canSaveFolders = typeof window.showDirectoryPicker === 'function';
 
+  // ============================================================ save location
+  // Where received files go. Where the browser allows it, the person picks a folder once; it's
+  // remembered on this device (a local folder handle in IndexedDB — never sent anywhere) and
+  // every save goes straight into it. Elsewhere the browser decides, so we explain the options.
+  const saveDest = { handle: null, granted: false };
+  const kv = {
+    db: null,
+    open() {
+      this.db ||= new Promise((res, rej) => {
+        const r = indexedDB.open('locshare', 1);
+        r.onupgradeneeded = () => r.result.createObjectStore('kv');
+        r.onsuccess = () => res(r.result);
+        r.onerror = () => rej(r.error);
+      });
+      return this.db;
+    },
+    async get(k) {
+      const db = await this.open();
+      return new Promise((res, rej) => { const q = db.transaction('kv').objectStore('kv').get(k); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
+    },
+    async set(k, v) {
+      const db = await this.open();
+      return new Promise((res, rej) => {
+        const t = db.transaction('kv', 'readwrite');
+        if (v === undefined) t.objectStore('kv').delete(k); else t.objectStore('kv').put(v, k);
+        t.oncomplete = () => res();
+        t.onerror = () => rej(t.error);
+      });
+    },
+  };
+
+  async function loadSaveDest() {
+    if (canSaveFolders) {
+      try { saveDest.handle = (await kv.get('saveDir')) || null; } catch { saveDest.handle = null; }
+      if (saveDest.handle) {
+        try { saveDest.granted = (await saveDest.handle.queryPermission({ mode: 'readwrite' })) === 'granted'; } catch { saveDest.handle = null; }
+      }
+    }
+    renderSaveLoc();
+  }
+
+  // The chosen folder, if we may write to it. `interactive` may show the browser's "allow" prompt,
+  // which needs a click — so pass true only from click handlers.
+  async function destDir(interactive) {
+    const hdl = saveDest.handle;
+    if (!hdl) return null;
+    let perm = await hdl.queryPermission({ mode: 'readwrite' }).catch(() => 'denied');
+    if (perm !== 'granted' && interactive) perm = await hdl.requestPermission({ mode: 'readwrite' }).catch(() => 'denied');
+    const was = saveDest.granted;
+    saveDest.granted = perm === 'granted';
+    if (was !== saveDest.granted) renderSaveLoc();
+    return saveDest.granted ? hdl : null;
+  }
+
+  async function chooseSaveDest() {
+    try {
+      const hdl = await window.showDirectoryPicker({ id: 'locshare-dest', mode: 'readwrite' });
+      saveDest.handle = hdl;
+      saveDest.granted = true;
+      try { await kv.set('saveDir', hdl); } catch { /* not remembered, still used this visit */ }
+      renderSaveLoc();
+      toast(`Received files will go to “${hdl.name}”`, 'ok');
+    } catch (err) {
+      if (err.name !== 'AbortError') toast(err.message, 'err');
+    }
+  }
+
+  async function clearSaveDest() {
+    saveDest.handle = null;
+    saveDest.granted = false;
+    try { await kv.set('saveDir', undefined); } catch { /* ignore */ }
+    renderSaveLoc();
+    toast('Will ask where to save each time');
+  }
+
+  const isChromium = /Chrome\/|Edg\//.test(navigator.userAgent) && !/OPR\//.test(navigator.userAgent);
+  const FOLDER_SVG = '<svg viewBox="0 0 24 24"><path d="M3 7.5A2.5 2.5 0 015.5 5h3.6l2 2.2h7.4A2.5 2.5 0 0121 9.7v7.8A2.5 2.5 0 0118.5 20h-13A2.5 2.5 0 013 17.5z"/></svg>';
+  const saveLabels = new Set(); // buttons whose label mentions the destination
+
+  function renderSaveLoc() {
+    for (const el of $$('.save-loc')) {
+      el.textContent = '';
+      el.classList.toggle('set', !!saveDest.handle);
+      const text = h('span', { class: 'sl-text' }, h('small', {}, 'Save to'));
+      const actions = h('span', { class: 'sl-actions' });
+      if (!canSaveFolders) {
+        text.append(h('b', {}, 'Your browser’s download folder'));
+        actions.append(h('button', { class: 'ghost small', type: 'button', 'aria-expanded': 'false', onclick: (e) => {
+          const open = el.classList.toggle('help-open');
+          e.currentTarget.setAttribute('aria-expanded', open);
+        } }, 'Change…'));
+        const tips = [];
+        if (isChromium) {
+          tips.push(h('li', { html: 'Easiest: start LocShare with <code>npm run https</code> and open the <b>https://</b> address. You can then pick any folder here once, and everything lands there.' }));
+        } else {
+          tips.push(h('li', { html: 'Picking a folder from the page works in <b>Chrome</b> and <b>Edge</b> (with <code>npm run https</code>).' }));
+        }
+        tips.push(h('li', { html: 'Or make your browser ask every time: <b>Chrome/Edge</b> → Settings → Downloads → “Ask where to save each file” · <b>Firefox</b> → Settings → Downloads → “Always ask you where to save files” · <b>Safari</b> → Settings → General → File download location → “Ask for each download”.' }));
+        el.append(h('span', { class: 'sl-ico', html: FOLDER_SVG }), text, actions,
+          h('div', { class: 'sl-help' }, h('p', {}, 'Browsers only let web pages save into a chosen folder over a secure (HTTPS) connection.'), h('ul', {}, tips)));
+      } else if (!saveDest.handle) {
+        text.append(h('b', {}, 'Ask each time'));
+        actions.append(h('button', { class: 'ghost small', type: 'button', onclick: chooseSaveDest }, 'Choose folder'));
+        el.append(h('span', { class: 'sl-ico', html: FOLDER_SVG }), text, actions);
+      } else {
+        text.append(h('b', { title: saveDest.handle.name }, saveDest.handle.name));
+        if (!saveDest.granted) text.append(h('em', {}, 'Your browser will ask to allow access when you save'));
+        actions.append(
+          h('button', { class: 'ghost small', type: 'button', onclick: chooseSaveDest }, 'Change'),
+          h('button', { class: 'x-btn', type: 'button', title: 'Ask each time instead', 'aria-label': 'Stop using this folder', html: ICON.x, onclick: clearSaveDest }));
+        el.append(h('span', { class: 'sl-ico', html: FOLDER_SVG }), text, actions);
+      }
+    }
+    for (const fn of saveLabels) fn();
+  }
+
   // ============================================================ share reader
   // Shared by the one-off receive page and live sessions: decrypts a share's files on demand.
 
@@ -999,6 +1115,8 @@
     async function saveFile(idx, onProgress) {
       const f = files[idx];
       const name = safeSegments(f.path || f.name).pop() || 'file';
+      const dest = await destDir(true);
+      if (dest) return saveTree([idx], [], (frac, i, p) => onProgress?.(p), dest, true);
       if (kept.has(idx)) { saveBlob(kept.get(idx).blob, name); onProgress?.(1); return; }
       const sink = await openSink(name, f.type);
       try { await streamFile(idx, (d) => sink.write(d), onProgress); await sink.close(); } catch (e) { sink.abort(); throw e; }
@@ -1008,8 +1126,9 @@
     const pathOf = (idx) => files[idx].path || files[idx].name;
 
     // Write files into a real folder on disk, recreating the directory tree (Chromium, HTTPS/localhost).
-    async function saveTree(idxs, dirList, onProgress) {
-      const root = await window.showDirectoryPicker({ id: 'locshare', mode: 'readwrite' });
+    // `root` is the remembered save folder, or the person picks one now. `flat` drops folder paths.
+    async function saveTree(idxs, dirList, onProgress, root, flat) {
+      root ||= await window.showDirectoryPicker({ id: 'locshare', mode: 'readwrite' });
       const exists = async (name) => {
         for (const get of ['getDirectoryHandle', 'getFileHandle']) {
           try { await root[get](name); return true; } catch { /* not this kind */ }
@@ -1045,7 +1164,7 @@
       const totalBytes = idxs.reduce((n, i) => n + files[i].size, 0);
       let doneBytes = 0;
       for (const idx of idxs) {
-        const segs = await mapPath(pathOf(idx));
+        const segs = await mapPath(flat ? safeSegments(pathOf(idx)).pop() || 'file' : pathOf(idx));
         const name = segs.pop() || 'file';
         const dir = await dirFor(segs);
         const w = await (await dir.getFileHandle(name, { create: true })).createWritable();
@@ -1078,15 +1197,19 @@
     const all = files.map((_, i) => i);
     const today = () => new Date().toISOString().slice(0, 10);
 
-    function saveFolder(top, onProgress) {
+    async function saveFolder(top, onProgress) {
       const idxs = all.filter((i) => topOf(pathOf(i)) === top);
       const sub = dirs.filter((d) => safeSegments(d)[0] === top);
-      return canSaveFolders ? saveTree(idxs, sub, onProgress) : saveZip(idxs, sub, `${top}.zip`, onProgress);
+      const dest = await destDir(true);
+      if (dest || canSaveFolders) return saveTree(idxs, sub, onProgress, dest);
+      return saveZip(idxs, sub, `${top}.zip`, onProgress);
     }
 
-    function saveAll(onProgress) {
+    async function saveAll(onProgress) {
       if (files.length === 1 && !dirs.length) return saveFile(0, (p) => onProgress?.(p, 0, p));
-      return canSaveFolders ? saveTree(all, dirs, onProgress) : saveZip(all, dirs, `locshare-${today()}.zip`, onProgress);
+      const dest = await destDir(true);
+      if (dest || canSaveFolders) return saveTree(all, dirs, onProgress, dest);
+      return saveZip(all, dirs, `locshare-${today()}.zip`, onProgress);
     }
 
     const hasFolders = all.some((i) => topOf(pathOf(i))) || dirs.length > 0;
@@ -1122,6 +1245,7 @@
           reader.ack();
           btn.classList.add('done');
           btn.innerHTML = ICON.ok;
+          if (savedWhere()) toast(`Saved “${label}”${savedWhere()}`, 'ok');
         } catch (err) {
           if (err.name !== 'AbortError') toast(err.message, 'err');
           btn.innerHTML = ICON.dl;
@@ -1197,7 +1321,8 @@
             reader.ack();
             btn.classList.add('done');
             btn.innerHTML = ICON.ok;
-            toast(canSaveFolders ? `Saved folder “${g.name}”` : `Saved “${g.name}.zip” — this browser can’t write folders directly`, 'ok');
+            toast(savedWhere() ? `Saved folder “${g.name}”${savedWhere()}`
+              : canSaveFolders ? `Saved folder “${g.name}”` : `Saved “${g.name}.zip” — this browser can’t write folders directly`, 'ok');
           } catch (err) {
             if (err.name !== 'AbortError') toast(err.message, 'err');
             btn.innerHTML = ICON.folderDl;
@@ -1213,8 +1338,14 @@
     };
   }
 
-  const saveAllLabel = (reader) => (reader.files.length === 1 && !reader.hasFolders ? 'Save'
-    : canSaveFolders ? (reader.hasFolders ? 'Save all to a folder' : 'Save all into a folder') : 'Save all as .zip');
+  const destName = () => (saveDest.handle ? `“${saveDest.handle.name}”` : null);
+  const saveAllLabel = (reader) => {
+    const single = reader.files.length === 1 && !reader.hasFolders;
+    if (destName()) return `${single ? 'Save' : 'Save all'} to ${destName()}`;
+    if (single) return 'Save';
+    return canSaveFolders ? (reader.hasFolders ? 'Save all to a folder' : 'Save all into a folder') : 'Save all as .zip';
+  };
+  const savedWhere = () => (destName() && saveDest.granted ? ` to ${destName()}` : '');
 
   async function copyText(text, el) {
     try { await navigator.clipboard.writeText(text); } catch {
@@ -1288,6 +1419,7 @@
     const view = renderShare(reader, $('#recvList'), { button: !manifest.burn, preview: !manifest.burn });
 
     $('#recvMeta').textContent = `${fileCount ? `${fmtBytes(reader.total)} · ` : ''}verified & decrypted on this device`;
+    $('#recvSaveLoc').classList.toggle('hidden', !fileCount);
 
     // Note-only self-destructing share: burn right away, the note is already on screen.
     if (manifest.burn && !fileCount) {
@@ -1300,7 +1432,13 @@
     const saveAll = $('#saveAllBtn');
     if (fileCount > 1 || reader.hasFolders || manifest.burn) {
       saveAll.classList.remove('hidden');
-      $('.cta-text', saveAll).textContent = manifest.burn ? `Decrypt & ${saveAllLabel(reader).toLowerCase()}` : saveAllLabel(reader);
+      const relabel = () => {
+        if (saveAll.classList.contains('busy') || saveAll.disabled) return;
+        const l = saveAllLabel(reader);
+        $('.cta-text', saveAll).textContent = manifest.burn ? `Decrypt & ${l[0].toLowerCase()}${l.slice(1)}` : l;
+      };
+      relabel();
+      saveLabels.add(relabel);
       saveAll.onclick = async () => {
         if (saveAll.classList.contains('busy') || saveAll.disabled) return;
         try {
@@ -1311,7 +1449,7 @@
           saveAll.classList.add('busy');
           await pending;
           setProgress(saveAll, 1, 'Saved');
-          toast(`Saved ${fileCount > 1 ? summary : manifest.files[0].name}`, 'ok');
+          toast(`Saved ${fileCount > 1 ? summary : manifest.files[0].name}${savedWhere()}`, 'ok');
           if (manifest.burn) {
             await api(`/api/s/${id}`, { method: 'DELETE' }).catch(() => {});
             forget();
@@ -1623,8 +1761,9 @@
     const view = renderShare(reader, ul, { preview: false });
     const n = reader.files.length;
     if (n > 1 && view.groups.length > 1) {
-      const label = saveAllLabel(reader);
+      let label = saveAllLabel(reader);
       const btn = h('button', { class: 'ghost small' }, label);
+      saveLabels.add(() => { if (!btn.disabled && !/Saved|Saving/.test(btn.textContent)) btn.textContent = label = saveAllLabel(reader); });
       btn.addEventListener('click', async () => {
         try {
           const pending = reader.saveAll((frac, idx, p) => view.progress(idx, p));
@@ -1663,9 +1802,16 @@
       li.classList.add('delivered');
       roomSend({ t: 'got', id: msg.id }, from).catch(() => {});
       if ($('#autoSave').checked) {
-        // Loose files download straight away; folders need one tap (the browser asks where to put them).
-        reader.files.forEach((f, idx) => { if (!topOf(f.path || f.name)) saveBlob(reader.kept.get(idx).blob, f.name); });
-        if (reader.hasFolders) toast('Folder received — tap its save button to choose where it goes', 'ok');
+        const dest = await destDir(false);
+        if (dest) {
+          // A remembered folder with access already granted: everything, folders included, goes straight in.
+          await reader.saveAll((frac, idx, p) => view.progress(idx, p));
+          foot.textContent = `Received ${fmtBytes(reader.total)} · saved to “${dest.name}”`;
+        } else {
+          // Loose files download straight away; folders need one tap (the browser asks where to put them).
+          reader.files.forEach((f, idx) => { if (!topOf(f.path || f.name)) saveBlob(reader.kept.get(idx).blob, f.name); });
+          if (reader.hasFolders) toast('Folder received — tap its save button to choose where it goes', 'ok');
+        }
         reader.ack();
       }
     } catch (err) {
@@ -1855,6 +2001,7 @@
   });
 
   // ============================================================ boot
+  loadSaveDest();
   const route = location.pathname.match(/^\/([rp])\/([A-Za-z0-9_-]{22})$/);
   if (route?.[1] === 'r') receive(route[2]);
   else if (route?.[1] === 'p') {
