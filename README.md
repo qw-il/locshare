@@ -15,8 +15,21 @@ The server prints addresses such as `http://192.168.1.20:8080`. Open one in a br
 |---|---|---|
 | `PORT` | `8080` | Port to listen on |
 | `HOST` | `0.0.0.0` | Interface to bind |
-| `MAX_STORE_MB` | `2048` | RAM budget for all shares combined |
+| `MAX_STORE_MB` | `2048` | RAM the host may use to hold shares. Larger shares stream live instead — this is **not** a file size limit |
 | `TLS_CERT` / `TLS_KEY` | — | Serve over HTTPS (recommended, see below) |
+
+## No file size limit
+
+There are two ways a share can travel. LocShare picks one automatically:
+
+- **Stored.** If the encrypted share fits in the host's memory budget, it is uploaded once. The sender can then close the tab and the recipient downloads whenever they like until it expires.
+- **Live.** If the share is bigger than that, it streams directly from the sender's tab. The host relays each encrypted block from the sender's browser to the recipient and never stores it. The sender's tab must stay open until the download finishes. The page warns before closing, and the recipient sees a clear message if the sender has gone.
+
+On the recipient's side, files are decrypted block by block:
+- **Chrome and Edge over HTTPS or `localhost`:** decrypted data is written straight to disk via a save dialog, so memory use stays flat whatever the size.
+- **Elsewhere:** data is collected in batches into Blobs, which browsers can page to disk.
+
+"Save all" writes a streaming ZIP64 archive, so there is no 4 GB or file-count cap.
 
 ## How privacy is protected
 
@@ -26,6 +39,7 @@ The server prints addresses such as `http://192.168.1.20:8080`. Open one in a br
 - **Tamper detection.** Every block is authenticated, and its nonce is tied to its position, so blocks can't be modified, swapped, reordered or truncated without being detected.
 - **RAM only, no logs.** Ciphertext is never written to disk. Buffers are zeroed when a share expires, is revoked or self-destructs, or when the server stops. Nothing about requests is logged.
 - **Unlisted.** Shares can't be browsed or listed. Each has a random 128‑bit ID, and a missing share and an expired share return the same response.
+- **Live mode stores nothing.** Oversized shares are relayed block by block and never kept on the host, not even in memory.
 - **Ephemeral by design.** Shares expire after 5 minutes to 24 hours. They can be revoked at any time or set to self-destruct after the first download.
 - **No third parties.** There are no CDNs, web fonts, analytics or cookies, and a strict Content-Security-Policy and `no-referrer` are applied to every response.
 
@@ -45,7 +59,6 @@ The server prints addresses such as `http://192.168.1.20:8080`. Open one in a br
 
   Browsers will ask you to trust the self-signed certificate once.
 
-## Limits
+## Tip for very large files
 
-- Received files are decrypted in browser memory before saving, so very large files (multiple GB) depend on the receiving device's RAM.
-- "Save all" produces an uncompressed zip, which is limited to 4 GB in total.
+Run LocShare with HTTPS (see above) and receive in Chrome or Edge. The browser then streams decrypted data straight to disk, so even a file larger than the recipient's RAM saves smoothly.

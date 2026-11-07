@@ -9,6 +9,8 @@
  *  - File names, types, sizes and notes are encrypted too (inside the manifest).
  *  - Content is padded to fixed-size chunks, so the server only learns a rounded size.
  *  - Everything is kept in RAM only. Nothing is ever written to disk, and nothing is logged.
+ *  - There is no size limit: shares too big for the host's memory budget are streamed live
+ *    from the sender's browser, block by block, and never stored at all.
  *  - Shares are unlisted (128-bit random IDs), expire automatically and can be revoked
  *    or set to self-destruct after the first download.
  */
@@ -32,9 +34,10 @@ const CHUNK_SIZE = 1024 * 1024;                 // plaintext bytes per chunk (mu
 const CHUNK_OVERHEAD = 24 + 16;                 // nonce + Poly1305 tag
 const MAX_CHUNK_BODY = CHUNK_SIZE + CHUNK_OVERHEAD;
 const MAX_MANIFEST_BODY = 256 * 1024;
-const MAX_CHUNKS = Math.floor((8 * 1024 * 1024 * 1024) / CHUNK_SIZE); // 8 GiB hard ceiling
 const TTL_CHOICES = [5, 15, 60, 360, 1440];     // minutes
 const UPLOAD_IDLE_MS = 10 * 60 * 1000;          // unsealed shares die after 10 idle minutes
+const LIVE_GRACE_MS = 30 * 1000;                // live shares die if the sender is gone this long
+const LIVE_WAIT_MS = 2 * 60 * 1000;             // max wait for the sender to answer a block request
 
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const VENDOR = {
@@ -51,7 +54,7 @@ function newId(bytes) {
   return crypto.randomBytes(bytes).toString('base64url');
 }
 
-function createShare(ttlMin, burn) {
+function createShare(ttlMin, burn, live) {
   const id = newId(16);
   const share = {
     id,
@@ -65,7 +68,14 @@ function createShare(ttlMin, burn) {
     expiresAt: Date.now() + UPLOAD_IDLE_MS,
     opens: 0,
     downloads: 0,
+    // live (streamed) shares
+    live: !!live,
+    chunkCount: 0,
+    sender: null,          // open response stream to the sender's tab
+    pending: new Map(),    // reqId -> { index, res, timer }
+    orphanTimer: null,
   };
+  if (share.live) share.orphanTimer = setTimeout(() => destroyShare(share), UPLOAD_IDLE_MS);
   shares.set(id, share);
   return share;
 }
@@ -76,6 +86,10 @@ function destroyShare(share) {
   for (const c of share.chunks) if (c) c.fill(0);
   if (share.manifest) share.manifest.fill(0);
   storedBytes -= share.bytes;
+  clearTimeout(share.orphanTimer);
+  for (const p of share.pending.values()) { clearTimeout(p.timer); if (!p.res.headersSent) fail(p.res, 410, 'Share is gone'); else p.res.destroy(); }
+  share.pending.clear();
+  if (share.sender) { share.sender.end('gone\n'); share.sender = null; }
   share.chunks = [];
   share.manifest = null;
   shares.delete(share.id);
@@ -143,7 +157,8 @@ function isOwner(req, share) {
 function publicInfo(share) {
   return {
     sealed: share.sealed,
-    chunks: share.chunks.length,
+    chunks: share.live ? share.chunkCount : share.chunks.length,
+    live: share.live,
     burn: share.burn,
     expiresAt: share.expiresAt,
   };
@@ -197,12 +212,13 @@ async function handle(req, res) {
       const body = JSON.parse((await readBody(req, 1024)).toString() || '{}');
       const ttl = TTL_CHOICES.includes(body.ttl) ? body.ttl : 60;
       const need = Number(body.bytes) || 0;
-      if (need > MAX_STORE_BYTES - storedBytes) return fail(res, 507, 'Not enough free memory on the host for this share');
-      const s = createShare(ttl, body.burn);
+      // Too big for RAM? The client streams it live instead, so this never limits file size.
+      if (!body.live && need > MAX_STORE_BYTES - storedBytes) return fail(res, 507, 'Not enough free memory on the host — use live streaming');
+      const s = createShare(ttl, body.burn, body.live);
       return send(res, 201, { id: s.id, ownerToken: s.ownerToken });
     }
 
-    const sm = p.match(/^\/api\/s\/([A-Za-z0-9_-]{22})(?:\/(c|m|a)(?:\/(\d{1,7}))?)?$/);
+    const sm = p.match(/^\/api\/s\/([A-Za-z0-9_-]{22})(?:\/(c|m|a|w)(?:\/(\d{1,12}))?)?$/);
     if (sm) {
       const share = shares.get(sm[1]);
       // Same response for "never existed" and "expired" — reveals nothing.
@@ -212,7 +228,7 @@ async function handle(req, res) {
 
       if (!kind && m === 'GET') {
         const info = publicInfo(share);
-        if (isOwner(req, share)) Object.assign(info, { opens: share.opens, downloads: share.downloads });
+        if (isOwner(req, share)) Object.assign(info, { opens: share.opens, downloads: share.downloads, senderOnline: !!share.sender });
         return send(res, 200, info);
       }
 
@@ -223,11 +239,44 @@ async function handle(req, res) {
         return send(res, 200, { ok: true });
       }
 
+      // Live shares: the sender's tab holds this channel open and is told which blocks to send.
+      if (kind === 'w' && m === 'GET') {
+        if (!share.live || !isOwner(req, share)) return fail(res, 403, 'Forbidden');
+        if (share.sender) share.sender.end();
+        clearTimeout(share.orphanTimer);
+        res.writeHead(200, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain; charset=utf-8', 'X-Accel-Buffering': 'no' });
+        res.write('ready\n');
+        share.sender = res;
+        const beat = setInterval(() => res.write(':\n'), 15000);
+        res.on('close', () => {
+          clearInterval(beat);
+          if (share.sender !== res) return;
+          share.sender = null;
+          if (shares.has(share.id)) share.orphanTimer = setTimeout(() => destroyShare(share), LIVE_GRACE_MS);
+        });
+        return;
+      }
+
+      // Live shares: the sender answers a block request; we pipe it straight to the recipient.
+      if (kind === 'c' && m === 'PUT' && index !== undefined && share.live) {
+        if (!isOwner(req, share)) return fail(res, 403, 'Forbidden');
+        const pend = share.pending.get(url.searchParams.get('r') || '');
+        if (!pend || pend.index !== index) { req.resume(); return fail(res, 410, 'Request no longer pending'); }
+        if (parseInt(req.headers['content-length'], 10) !== MAX_CHUNK_BODY) { req.resume(); return fail(res, 400, 'Chunks must be padded to full size'); }
+        share.pending.delete(url.searchParams.get('r'));
+        clearTimeout(pend.timer);
+        pend.res.writeHead(200, { ...SECURITY_HEADERS, 'Content-Type': 'application/octet-stream', 'Content-Length': MAX_CHUNK_BODY });
+        pend.res.on('error', () => {});
+        req.pipe(pend.res);
+        req.on('end', () => send(res, 200, { ok: true }));
+        req.on('error', () => pend.res.destroy());
+        return;
+      }
+
       // Upload a ciphertext chunk.
       if (kind === 'c' && m === 'PUT' && index !== undefined) {
         if (!isOwner(req, share)) return fail(res, 403, 'Forbidden');
         if (share.sealed) return fail(res, 409, 'Share is sealed');
-        if (index >= MAX_CHUNKS) return fail(res, 413, 'Share too large');
         const body = await readBody(req, MAX_CHUNK_BODY);
         if (body.length !== MAX_CHUNK_BODY) return fail(res, 400, 'Chunks must be padded to full size');
         if (storedBytes + body.length > MAX_STORE_BYTES) return fail(res, 507, 'Host memory budget exhausted');
@@ -246,8 +295,10 @@ async function handle(req, res) {
         if (!isOwner(req, share)) return fail(res, 403, 'Forbidden');
         if (share.sealed) return fail(res, 409, 'Share is sealed');
         const count = parseInt(req.headers['x-chunk-count'], 10);
-        if (!(count >= 0) || count !== share.chunks.length) return fail(res, 400, 'Chunk count mismatch');
-        for (let i = 0; i < count; i++) if (!share.chunks[i]) return fail(res, 400, `Missing chunk ${i}`);
+        if (!(count >= 0)) return fail(res, 400, 'Missing chunk count');
+        if (share.live) share.chunkCount = count;
+        else if (count !== share.chunks.length) return fail(res, 400, 'Chunk count mismatch');
+        if (!share.live) for (let i = 0; i < count; i++) if (!share.chunks[i]) return fail(res, 400, `Missing chunk ${i}`);
         const body = await readBody(req, MAX_MANIFEST_BODY);
         share.manifest = body;
         share.bytes += body.length;
@@ -268,6 +319,17 @@ async function handle(req, res) {
         if (!share.sealed) return fail(res, 404, 'Not found');
         share.downloads++;
         return send(res, 200, { ok: true });
+      }
+
+      if (kind === 'c' && m === 'GET' && index !== undefined && share.live) {
+        if (!share.sealed || index >= share.chunkCount) return fail(res, 404, 'Not found');
+        if (!share.sender) return fail(res, 503, 'The sender is offline — their LocShare tab must stay open');
+        const reqId = newId(9);
+        const timer = setTimeout(() => { share.pending.delete(reqId); if (!res.headersSent) fail(res, 504, 'The sender did not respond'); }, LIVE_WAIT_MS);
+        share.pending.set(reqId, { index, res, timer });
+        res.on('close', () => { if (share.pending.get(reqId)?.res === res) { clearTimeout(timer); share.pending.delete(reqId); } });
+        share.sender.write(`need ${reqId} ${index}\n`);
+        return;
       }
 
       if (kind === 'c' && m === 'GET' && index !== undefined) {

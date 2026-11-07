@@ -130,40 +130,102 @@
     return ~crc >>> 0;
   }
 
-  // Minimal "stored" (uncompressed) zip — fast, and keeps everything in the browser.
-  function buildZip(entries) {
+  // ---- output sinks: where decrypted bytes go, without ever holding a whole file in JS memory.
+  // With the File System Access API (Chromium over HTTPS/localhost) bytes stream straight to disk.
+  // Otherwise they're gathered into Blobs in batches, which browsers can page out of RAM.
+  async function openSink(name, type) {
+    if (window.showSaveFilePicker) {
+      try {
+        const handle = await window.showSaveFilePicker({ suggestedName: name });
+        const w = await handle.createWritable();
+        return { write: (d) => w.write(d), close: () => w.close(), abort: () => w.abort().catch(() => {}) };
+      } catch (err) {
+        if (err.name === 'AbortError') throw err; // user cancelled the dialog
+      }
+    }
+    const blobs = [];
+    let parts = [];
+    let size = 0;
+    return {
+      write(d) {
+        parts.push(d);
+        size += d.byteLength ?? d.size;
+        if (size >= 32 * 1024 * 1024) { blobs.push(new Blob(parts)); parts = []; size = 0; }
+      },
+      close() { blobs.push(new Blob(parts)); saveBlob(new Blob(blobs, { type: type || 'application/octet-stream' }), name); },
+      abort() { blobs.length = 0; parts = []; },
+    };
+  }
+
+  // Streaming "stored" zip writer with ZIP64 — no size or file-count limits.
+  // CRCs go in data descriptors after each file, so nothing needs to be buffered.
+  function zipWriter(sink) {
     const enc = new TextEncoder();
-    const parts = [];
-    const central = [];
+    const MAX32 = 0xffffffff;
+    const files = [];
+    const used = new Set();
     let offset = 0;
     const d = new Date();
     const time = (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1);
     const date = ((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();
-    const used = new Set();
-    for (const e of entries) {
-      let name = e.name.replace(/[\\/]/g, '_') || 'file';
-      for (let i = 2; used.has(name); i++) name = e.name.replace(/(\.[^.]*)?$/, ` (${i})$1`);
-      used.add(name);
-      const nb = enc.encode(name);
-      const lh = new DataView(new ArrayBuffer(30));
-      lh.setUint32(0, 0x04034b50, true); lh.setUint16(4, 20, true); lh.setUint16(6, 0x0800, true);
-      lh.setUint16(8, 0, true); lh.setUint16(10, time, true); lh.setUint16(12, date, true);
-      lh.setUint32(14, e.crc, true); lh.setUint32(18, e.blob.size, true); lh.setUint32(22, e.blob.size, true);
-      lh.setUint16(26, nb.length, true); lh.setUint16(28, 0, true);
-      parts.push(lh.buffer, nb, e.blob);
-      const ch = new DataView(new ArrayBuffer(46));
-      ch.setUint32(0, 0x02014b50, true); ch.setUint16(4, 20, true); ch.setUint16(6, 20, true); ch.setUint16(8, 0x0800, true);
-      ch.setUint16(10, 0, true); ch.setUint16(12, time, true); ch.setUint16(14, date, true);
-      ch.setUint32(16, e.crc, true); ch.setUint32(20, e.blob.size, true); ch.setUint32(24, e.blob.size, true);
-      ch.setUint16(28, nb.length, true); ch.setUint32(42, offset, true);
-      central.push(ch.buffer, nb);
-      offset += 30 + nb.length + e.blob.size;
-    }
-    const cdSize = central.reduce((s, p) => s + p.byteLength, 0);
-    const end = new DataView(new ArrayBuffer(22));
-    end.setUint32(0, 0x06054b50, true); end.setUint16(8, entries.length, true); end.setUint16(10, entries.length, true);
-    end.setUint32(12, cdSize, true); end.setUint32(16, offset, true);
-    return new Blob([...parts, ...central, end.buffer], { type: 'application/zip' });
+    const put = async (data) => { await sink.write(data); offset += data.byteLength ?? data.size; };
+    const view = (n) => { const b = new Uint8Array(n); return [b, new DataView(b.buffer)]; };
+    const u64 = (dv, at, v) => dv.setBigUint64(at, BigInt(v), true);
+
+    return {
+      async add(rawName, size, writeData) {
+        let name = rawName.replace(/[\\/]/g, '_') || 'file';
+        for (let i = 2; used.has(name); i++) name = rawName.replace(/(\.[^.]*)?$/, ` (${i})$1`);
+        used.add(name);
+        const nb = enc.encode(name);
+        const big = size >= MAX32;
+        const start = offset;
+        const [lh, l] = view(30 + nb.length + (big ? 20 : 0));
+        l.setUint32(0, 0x04034b50, true); l.setUint16(4, big ? 45 : 20, true); l.setUint16(6, 0x0808, true);
+        l.setUint16(10, time, true); l.setUint16(12, date, true);
+        l.setUint32(18, big ? MAX32 : size, true); l.setUint32(22, big ? MAX32 : size, true);
+        l.setUint16(26, nb.length, true); l.setUint16(28, big ? 20 : 0, true);
+        lh.set(nb, 30);
+        if (big) { const x = 30 + nb.length; l.setUint16(x, 1, true); l.setUint16(x + 2, 16, true); u64(l, x + 4, size); u64(l, x + 12, size); }
+        await put(lh);
+        const crc = await writeData(put);
+        const [dd, v] = view(big ? 24 : 16);
+        v.setUint32(0, 0x08074b50, true); v.setUint32(4, crc, true);
+        if (big) { u64(v, 8, size); u64(v, 16, size); } else { v.setUint32(8, size, true); v.setUint32(12, size, true); }
+        await put(dd);
+        files.push({ nb, size, crc, start });
+      },
+      async finish() {
+        const cdStart = offset;
+        for (const f of files) {
+          const z = f.size >= MAX32 || f.start >= MAX32;
+          const [ch, c] = view(46 + f.nb.length + (z ? 28 : 0));
+          c.setUint32(0, 0x02014b50, true); c.setUint16(4, 45, true); c.setUint16(6, z ? 45 : 20, true); c.setUint16(8, 0x0808, true);
+          c.setUint16(12, time, true); c.setUint16(14, date, true); c.setUint32(16, f.crc, true);
+          c.setUint32(20, z ? MAX32 : f.size, true); c.setUint32(24, z ? MAX32 : f.size, true);
+          c.setUint16(28, f.nb.length, true); c.setUint16(30, z ? 28 : 0, true); c.setUint32(42, z ? MAX32 : f.start, true);
+          ch.set(f.nb, 46);
+          if (z) { const x = 46 + f.nb.length; c.setUint16(x, 1, true); c.setUint16(x + 2, 24, true); u64(c, x + 4, f.size); u64(c, x + 12, f.size); u64(c, x + 20, f.start); }
+          await put(ch);
+        }
+        const cdSize = offset - cdStart;
+        const n = files.length;
+        if (n >= 0xffff || cdStart >= MAX32 || cdSize >= MAX32 || files.some((f) => f.size >= MAX32 || f.start >= MAX32)) {
+          const z64At = offset;
+          const [r, e] = view(56 + 20);
+          e.setUint32(0, 0x06064b50, true); u64(e, 4, 44); e.setUint16(12, 45, true); e.setUint16(14, 45, true);
+          u64(e, 24, n); u64(e, 32, n); u64(e, 40, cdSize); u64(e, 48, cdStart);
+          e.setUint32(56, 0x07064b50, true); u64(e, 64, z64At); e.setUint32(72, 1, true);
+          await put(r);
+        }
+        const [end, e] = view(22);
+        e.setUint32(0, 0x06054b50, true);
+        e.setUint16(8, Math.min(n, 0xffff), true); e.setUint16(10, Math.min(n, 0xffff), true);
+        e.setUint32(12, Math.min(cdSize, MAX32), true); e.setUint32(16, Math.min(cdStart, MAX32), true);
+        await put(end);
+        await sink.close();
+      },
+    };
   }
 
   // ============================================================ file visuals
@@ -368,6 +430,7 @@
     if (files.length) {
       const padded = Math.ceil(total / CHUNK) * CHUNK;
       msg = `${files.length} file${files.length > 1 ? 's' : ''} · ${fmtBytes(total)} — the host will only see ~${fmtBytes(padded || 0)} of noise`;
+      if (padded > info.freeBytes) msg = `${files.length} file${files.length > 1 ? 's' : ''} · ${fmtBytes(total)} — streams live from this tab, nothing stored on the host`;
     } else if (note.trim()) msg = `${note.length} characters — encrypted before sending`;
     $('#summary').textContent = msg;
   }
@@ -412,12 +475,22 @@
       total += f.size;
     }
     const chunks = Math.ceil(total / CHUNK);
+    const bytes = chunks * (CHUNK + 40);
 
-    const res = await api('/api/s', {
+    // No size limit: if the host can't hold the share in RAM, stream it live from this tab instead.
+    const fresh = await api('/api/info').then((r) => r.json()).catch(() => info);
+    let live = bytes > fresh.freeBytes;
+    const open = (asLive) => api('/api/s', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ttl: state.ttl, burn: state.burn, bytes: chunks * (CHUNK + 40) }),
+      body: JSON.stringify({ ttl: state.ttl, burn: state.burn, bytes, live: asLive }),
     });
+    let res;
+    try { res = await open(live); } catch (err) {
+      if (err.status !== 507) throw err;
+      live = true;
+      res = await open(true);
+    }
     const { id, ownerToken } = await res.json();
     const auth = { 'X-Owner-Token': ownerToken };
 
@@ -437,10 +510,17 @@
       return buf;
     }
 
+    const sealChunk = async (i) => {
+      const plain = await readChunk(i);
+      const body = seal(plain, chunkNonce(prefix, i), key);
+      plain.fill(0);
+      return body;
+    };
+
     let done = 0;
     onProgress(0);
     try {
-      await pool(chunks, 3, async (i) => {
+      if (!live) await pool(chunks, 3, async (i) => {
         const plain = await readChunk(i);
         const body = seal(plain, chunkNonce(prefix, i), key);
         plain.fill(0);
@@ -458,12 +538,61 @@
       const label = files.length
         ? (files.length === 1 ? files[0].name : `${files[0].name} + ${files.length - 1} more`)
         : 'Private note';
-      return { id, ownerToken, key: b64u.enc(key), label, expiresAt: sealed.expiresAt, ttlMs: state.ttl * 60e3, burn: state.burn, opens: 0, downloads: 0, gone: false };
+      const share = { id, ownerToken, key: b64u.enc(key), label, expiresAt: sealed.expiresAt, ttlMs: state.ttl * 60e3, burn: state.burn, opens: 0, downloads: 0, gone: false, live, senderOnline: false };
+      if (live) runLive(share, sealChunk);
+      return share;
     } catch (err) {
       api(`/api/s/${id}`, { method: 'DELETE', headers: auth }).catch(() => {});
       throw err;
     }
   }
+
+  // Live shares: keep a channel open to the host and answer block requests from this tab's files.
+  async function runLive(share, sealChunk) {
+    const auth = { 'X-Owner-Token': share.ownerToken };
+    share.abort = new AbortController();
+    let active = 0;
+    const queue = [];
+    const pump = () => {
+      while (active < 4 && queue.length) {
+        const [reqId, i] = queue.shift();
+        active++;
+        sealChunk(i)
+          .then((body) => fetch(`/api/s/${share.id}/c/${i}?r=${reqId}`, { method: 'PUT', headers: auth, body, cache: 'no-store', signal: share.abort.signal }))
+          .catch(() => {})
+          .finally(() => { active--; pump(); });
+      }
+    };
+    while (!share.gone) {
+      try {
+        const res = await fetch(`/api/s/${share.id}/w`, { headers: auth, cache: 'no-store', signal: share.abort.signal });
+        if (res.status === 404) { markGone(share, share.burn ? 'Received and self-destructed' : 'Expired — wiped from the host'); return; }
+        if (!res.ok) throw new Error();
+        const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+        let buf = '';
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += value;
+          let nl;
+          while ((nl = buf.indexOf('\n')) >= 0) {
+            const line = buf.slice(0, nl);
+            buf = buf.slice(nl + 1);
+            if (line === 'ready') share.senderOnline = true;
+            const m = line.match(/^need (\S+) (\d+)$/);
+            if (m) { queue.push([m[1], +m[2]]); pump(); }
+          }
+        }
+      } catch { /* network blip or aborted */ }
+      share.senderOnline = false;
+      if (!share.gone) await new Promise((r) => setTimeout(r, 1500));
+    }
+  }
+
+  // Closing the tab would end live shares — warn first.
+  window.addEventListener('beforeunload', (e) => {
+    if (mine.some((s) => s.live && !s.gone)) { e.preventDefault(); e.returnValue = ''; }
+  });
 
   // ============================================================ LINK VIEW
   let viewing = null;
@@ -522,6 +651,7 @@
     if (s.gone) return;
     s.gone = why;
     s.key = '';
+    s.abort?.abort();
     renderActive();
     if (s === viewing) renderStatus();
   }
@@ -555,7 +685,9 @@
       sub.textContent = 'Someone with the link unlocked the share.';
     } else {
       title.textContent = 'Waiting for recipient';
-      sub.textContent = s.burn ? 'Self-destructs after the first download.' : 'Nothing has been opened yet.';
+      sub.textContent = s.live
+        ? 'Streaming live from this tab — keep it open until they’re done.'
+        : s.burn ? 'Self-destructs after the first download.' : 'Nothing has been opened yet.';
     }
   }
 
@@ -580,6 +712,7 @@
         ul.prepend(li);
       }
       const bits = [`${fmtLeft(s.expiresAt - Date.now())} left`];
+      if (s.live) bits.push('live · keep tab open');
       if (s.burn) bits.push('self-destructs');
       if (s.opens) bits.push(`opened ${s.opens}×`);
       $('.act-meta', li).textContent = bits.join(' · ');
@@ -684,7 +817,6 @@
 
     const prefix = b64u.dec(manifest.prefix);
     const C = manifest.chunkSize;
-    const cache = new Map(); // decrypted file blobs: index -> {blob, crc}
     await new Promise((r) => setTimeout(r, 450)); // let the unlock animation breathe
     lock.className = 'lock open';
 
@@ -714,29 +846,33 @@
       return plain;
     }
 
-    async function decryptFile(idx, onProgress) {
-      if (cache.has(idx)) return cache.get(idx);
+    // Decrypt one file block by block, in order, with a few blocks fetched ahead.
+    // Each piece is handed to `write` and can be dropped right after — memory use stays flat.
+    async function streamFile(idx, write, onProgress, wantCrc) {
       const f = manifest.files[idx];
-      if (f.size === 0) { const r = { blob: new Blob([], { type: f.type }), crc: 0 }; cache.set(idx, r); return r; }
+      if (previews.has(idx)) { const p = previews.get(idx); await write(p.blob); onProgress?.(1); return p.crc; }
+      if (f.size === 0) { onProgress?.(1); return 0; }
       const first = Math.floor(f.offset / C);
-      const last = Math.floor((f.offset + f.size - 1) / C);
-      const n = last - first + 1;
-      const parts = new Array(n);
-      let done = 0;
-      await pool(n, 3, async (k) => {
-        const i = first + k;
-        const plain = await getChunk(i);
-        const a = Math.max(f.offset, i * C) - i * C;
-        const b = Math.min(f.offset + f.size, (i + 1) * C) - i * C;
-        parts[k] = plain.slice(a, b);
-        onProgress?.(++done / n);
-      });
+      const n = Math.floor((f.offset + f.size - 1) / C) - first + 1;
+      const AHEAD = 4;
+      const inflight = new Map();
+      const start = (k) => { const pr = getChunk(first + k); pr.catch(() => {}); inflight.set(k, pr); };
+      for (let k = 0; k < Math.min(AHEAD, n); k++) start(k);
       let crc = 0;
-      for (const p of parts) crc = crc32(p, crc);
-      const r = { blob: new Blob(parts, { type: f.type || 'application/octet-stream' }), crc };
-      cache.set(idx, r);
-      return r;
+      for (let k = 0; k < n; k++) {
+        const plain = await inflight.get(k);
+        inflight.delete(k);
+        if (k + AHEAD < n) start(k + AHEAD);
+        const i = first + k;
+        const part = plain.subarray(Math.max(f.offset, i * C) - i * C, Math.min(f.offset + f.size, (i + 1) * C) - i * C);
+        if (wantCrc) crc = crc32(part, crc);
+        await write(part);
+        onProgress?.((k + 1) / n);
+      }
+      return crc;
     }
+
+    const previews = new Map(); // idx -> { blob, crc } for small images shown inline
 
     const ack = () => api(`/api/s/${id}/a`, { method: 'POST' }).catch(() => {});
 
@@ -758,17 +894,19 @@
         btn.addEventListener('click', async () => {
           if (btn.disabled) return;
           btn.disabled = true;
-          btn.innerHTML = ICON.spin;
-          bar.parentElement.style.display = '';
+          let sink;
           try {
-            const { blob } = await decryptFile(idx, (p) => bar.parentElement.style.setProperty('--p', p));
-            bar.parentElement.style.setProperty('--p', 1);
-            saveBlob(blob, f.name);
+            sink = await openSink(f.name, f.type);
+            btn.innerHTML = ICON.spin;
+            bar.parentElement.style.display = '';
+            await streamFile(idx, (d) => sink.write(d), (p) => bar.parentElement.style.setProperty('--p', p));
+            await sink.close();
             ack();
             btn.classList.add('done');
             btn.innerHTML = ICON.ok;
           } catch (err) {
-            toast(err.message, 'err');
+            sink?.abort();
+            if (err.name !== 'AbortError') toast(err.message, 'err');
             btn.innerHTML = ICON.dl;
           } finally { btn.disabled = false; }
         });
@@ -781,7 +919,12 @@
     if (!manifest.burn) {
       manifest.files.forEach((f, idx) => {
         if (kindOf(f.name, f.type).k === 'img' && f.size <= 6e6 && !/svg/.test(f.type)) {
-          decryptFile(idx).then(({ blob }) => setThumb(rows[idx].icon, URL.createObjectURL(blob))).catch(() => {});
+          const parts = [];
+          streamFile(idx, (d) => parts.push(d), null, true).then((crc) => {
+            const blob = new Blob(parts, { type: f.type });
+            previews.set(idx, { blob, crc });
+            setThumb(rows[idx].icon, URL.createObjectURL(blob));
+          }).catch(() => {});
         }
       });
     }
@@ -805,35 +948,48 @@
         : 'Save all as .zip';
       saveAll.onclick = async () => {
         if (saveAll.classList.contains('busy')) return;
-        saveAll.classList.add('busy');
+        const single = fileCount === 1;
+        let sink;
         try {
-          const entries = [];
+          sink = await openSink(single ? manifest.files[0].name : `locshare-${new Date().toISOString().slice(0, 10)}.zip`,
+            single ? manifest.files[0].type : 'application/zip');
+          saveAll.classList.add('busy');
           let doneBytes = 0;
-          for (let idx = 0; idx < fileCount; idx++) {
+          const each = async (idx, write, wantCrc) => {
             const f = manifest.files[idx];
             rows[idx].bar.parentElement.style.display = '';
-            const r = await decryptFile(idx, (p) => {
+            const crc = await streamFile(idx, write, (p) => {
               rows[idx].bar.parentElement.style.setProperty('--p', p);
-              setProgress(saveAll, total ? (doneBytes + p * f.size) / total : 1, `Decrypting · ${Math.round(((doneBytes + p * f.size) / (total || 1)) * 100)}%`);
-            });
-            rows[idx].bar.parentElement.style.setProperty('--p', 1);
+              const frac = total ? (doneBytes + p * f.size) / total : 1;
+              setProgress(saveAll, frac, `Decrypting · ${Math.round(frac * 100)}%`);
+            }, wantCrc);
             doneBytes += f.size;
-            entries.push({ name: f.name, blob: r.blob, crc: r.crc });
+            return crc;
+          };
+          if (single) {
+            await each(0, (d) => sink.write(d), false);
+            await sink.close();
+          } else {
+            const zip = zipWriter(sink);
+            for (let idx = 0; idx < fileCount; idx++) {
+              await zip.add(manifest.files[idx].name, manifest.files[idx].size, (write) => each(idx, write, true));
+            }
+            await zip.finish();
           }
-          if (fileCount === 1) saveBlob(entries[0].blob, manifest.files[0].name);
-          else saveBlob(buildZip(entries), `locshare-${new Date().toISOString().slice(0, 10)}.zip`);
           setProgress(saveAll, 1, 'Saved');
           if (!manifest.burn) ack();
           toast(`Saved ${fileCount > 1 ? `${fileCount} files` : manifest.files[0].name}`, 'ok');
           if (manifest.burn) {
             await api(`/api/s/${id}`, { method: 'DELETE' }).catch(() => {});
             forget();
-            cache.clear();
+            previews.clear();
             sub.textContent = 'Saved. The share has self-destructed and was wiped from the host.';
             saveAll.disabled = true;
             setProgress(saveAll, 1, 'Destroyed ✓');
           }
         } catch (err) {
+          sink?.abort();
+          if (err.name === 'AbortError') return;
           toast(err.message, 'err');
           setProgress(saveAll, 0, 'Try again');
         } finally {
