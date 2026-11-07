@@ -41,7 +41,7 @@ const CHUNK_OVERHEAD = 24 + 16;                 // header + tag (nacl or AES-GCM
 // One request carries several chunks so a multi-gigabyte transfer isn't hundreds of
 // thousands of round trips. The slack covers per-chunk tag overhead.
 const BATCH_CAP = 8;
-const BATCH_TARGET = 16 * 1024 * 1024 + 64 * CHUNK_OVERHEAD;
+const BATCH_TARGET = 32 * 1024 * 1024 + 64 * CHUNK_OVERHEAD;
 function maxBatch(chunkBody) {
   return Math.max(1, Math.min(BATCH_CAP, Math.floor(BATCH_TARGET / chunkBody)));
 }
@@ -576,7 +576,7 @@ async function handle(req, res) {
       if (kind === 'c' && m === 'GET' && index !== undefined && share.live) {
         if (!share.sealed || index >= share.chunkCount) return fail(res, 404, 'Not found');
         if (!share.sender) return fail(res, 503, 'The sender is offline — their LocShare tab must stay open');
-        if (share.pending.size >= 8) return fail(res, 429, 'Too many block requests');
+        if (share.pending.size >= 16) return fail(res, 429, 'Too many block requests');
         const count = Math.min(askedCount(share, url), share.chunkCount - index);
         const reqId = newId(9);
         const timer = setTimeout(() => { share.pending.delete(reqId); if (!res.headersSent) fail(res, 504, 'The sender did not respond'); }, LIVE_WAIT_MS);
