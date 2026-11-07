@@ -92,6 +92,18 @@
         <p class="summary" id="summary">Add a file or write a note to begin.</p>
       </div>
 
+      <button class="pair-card" id="pairBtn" type="button">
+        <span class="pair-icon" aria-hidden="true">
+          <svg viewBox="0 0 32 32"><rect x="3" y="7" width="15" height="11" rx="2"/><path d="M7 22h7M10.5 18v4"/><rect x="21" y="9" width="8" height="15" rx="2"/><path d="M24 21h2"/></svg>
+          <span class="pair-wave"></span>
+        </span>
+        <span class="pair-text">
+          <b>Pair a device <em>Live</em></b>
+          <small>Connect a phone or laptop once — anything you drop appears on it instantly, both ways.</small>
+        </span>
+        <span class="pair-go" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 12h14m-6-6l6 6-6 6"/></svg></span>
+      </button>
+
       <div class="shares hidden" id="activeWrap">
         <h3>Active shares <small>this tab only</small></h3>
         <ul id="activeList"></ul>
@@ -138,6 +150,61 @@
           <button class="ghost danger" id="revokeBtn">Revoke now</button>
           <button class="ghost" id="newBtn">Share something else</button>
         </div>
+      </div>
+    </section>
+
+    <!-- =========================== LIVE SESSION ========================= -->
+    <section class="view hidden" id="view-room" data-view="room">
+      <div class="card glow room-card" id="roomView">
+        <div class="room-head">
+          <div class="room-title">
+            <h2>Live session</h2>
+            <p class="room-status off" id="roomStatus"><span class="pulse"></span><span>Connecting…</span></p>
+          </div>
+          <div class="room-actions">
+            <button class="icon-btn" id="roomInviteBtn" title="Show pairing code" aria-label="Show pairing code">
+              <svg viewBox="0 0 24 24"><rect x="3.5" y="3.5" width="6.5" height="6.5" rx="1.5"/><rect x="14" y="3.5" width="6.5" height="6.5" rx="1.5"/><rect x="3.5" y="14" width="6.5" height="6.5" rx="1.5"/><path d="M14 14h2.5v2.5H14zM18 18h2.5v2.5H18zM14 18.5v2M18.5 14h2"/></svg>
+            </button>
+            <button class="ghost small danger" id="roomLeaveBtn">Leave</button>
+          </div>
+        </div>
+
+        <div class="peers" id="peers"></div>
+
+        <div class="invite" id="roomInvite">
+          <div class="invite-inner">
+            <div class="qr-wrap small">
+              <canvas id="roomQr" width="480" height="480" aria-label="QR code to join this session"></canvas>
+              <div class="qr-scan" aria-hidden="true"></div>
+            </div>
+            <p class="sub small">Scan with a device on this network to pair it. The code carries the session key — only devices that scan it can read anything.</p>
+            <div class="link-row">
+              <input id="roomLink" readonly spellcheck="false" aria-label="Session link">
+              <button class="icon-btn" id="roomCopy" title="Copy session link">
+                <svg viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="3"/><path d="M16 8V6a2 2 0 00-2-2H6a2 2 0 00-2 2v8a2 2 0 002 2h2"/></svg>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <ul class="feed" id="feed" aria-live="polite"></ul>
+
+        <div class="composer">
+          <button class="icon-btn" id="roomAttach" title="Send files" aria-label="Send files">
+            <svg viewBox="0 0 24 24"><path d="M20 11.5l-7.8 7.8a5 5 0 01-7.1-7.1l8.5-8.5a3.3 3.3 0 014.7 4.7l-8.5 8.5a1.7 1.7 0 01-2.4-2.4l7.8-7.8"/></svg>
+          </button>
+          <input type="file" id="roomFiles" multiple hidden>
+          <textarea id="roomText" rows="1" placeholder="Message, or drop files…" spellcheck="false" aria-label="Message"></textarea>
+          <button class="icon-btn send" id="roomSendBtn" title="Send" aria-label="Send" disabled>
+            <svg viewBox="0 0 24 24"><path d="M12 19V5m0 0l-6 6m6-6l6 6"/></svg>
+          </button>
+        </div>
+        <label class="opt toggle mini">
+          <span class="opt-label">Auto-download received files</span>
+          <input type="checkbox" id="autoSave">
+          <span class="switch" aria-hidden="true"><span></span></span>
+        </label>
+        <div class="room-drop" aria-hidden="true"><span>Drop to send instantly</span></div>
       </div>
     </section>
 
@@ -189,6 +256,7 @@
       <li><b>Memory only.</b> The host keeps ciphertext in RAM, never on disk, and wipes it on expiry, revoke or self‑destruct.</li>
       <li><b>Unlisted.</b> No one can browse shares. Each has a random 128‑bit address that can't be guessed.</li>
       <li><b>Tamper‑proof.</b> Every block is authenticated; any modification is detected and rejected.</li>
+      <li><b>Live sessions too.</b> Paired devices share a key from the QR code. Messages, device names and files are sealed with it — the host only relays noise.</li>
       <li><b>Zero third parties.</b> No CDNs, fonts, analytics or cookies. Everything is served from your machine.</li>
     </ul>
     <button class="ghost" id="privacyClose">Got it</button>

@@ -18,6 +18,16 @@ The server prints addresses such as `http://192.168.1.20:8080`. Open one in a br
 | `MAX_STORE_MB` | `2048` | RAM the host may use to hold shares. Larger shares stream live instead — this is **not** a file size limit |
 | `TLS_CERT` / `TLS_KEY` | — | Serve over HTTPS (recommended, see below) |
 
+## Live sessions (paired devices)
+
+Click **Pair a device**, then scan the QR code on a phone, tablet or laptop on the same network. From then on, anything you drop, paste or type on one device appears on the others instantly, in both directions. Up to 8 devices can join a session.
+
+- **How it's protected.** The session key lives only in the QR code or link fragment. Device names, messages and file offers are sealed with that key before they're sent, and the server just relays opaque bytes between connected devices. A device that joins without the key sees nothing it can decrypt and is ignored.
+- **How files travel.** Each file streams live from the sender's tab: the other device starts pulling encrypted blocks the moment you drop it, with no upload step and no size limit.
+  - Batches up to 256 MB are decrypted automatically on arrival, so saving them is instant. You can also turn on auto-download.
+  - Larger batches stream straight to disk when you tap save.
+- **When it ends.** Leaving a session, or closing every tab in it, ends it. Any transfers in progress are revoked and wiped.
+
 ## No file size limit
 
 There are two ways a share can travel. LocShare picks one automatically:

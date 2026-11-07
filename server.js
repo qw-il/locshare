@@ -100,6 +100,38 @@ setInterval(() => {
   for (const s of shares.values()) if (s.expiresAt <= now) destroyShare(s);
 }, 5000).unref();
 
+// ---------------------------------------------------------------- live sessions (paired devices)
+// A room is a tiny encrypted message relay between devices that scanned the same QR code.
+// Every message is sealed client-side with the room key (which only lives in the link fragment),
+// so the server only ever forwards opaque bytes between connected peers.
+const ROOM_MAX_PEERS = 8;
+const ROOM_MAX_MSG = 256 * 1024;
+const ROOM_EMPTY_MS = 2 * 60 * 1000; // an empty room survives briefly so reloads can rejoin
+
+/** @type {Map<string, {id: string, peers: Map<string, {res: any, token: string}>, timer: any}>} */
+const rooms = new Map();
+
+function createRoom() {
+  const room = { id: newId(16), peers: new Map(), timer: null };
+  room.timer = setTimeout(() => closeRoom(room), ROOM_EMPTY_MS);
+  rooms.set(room.id, room);
+  return room;
+}
+
+function closeRoom(room) {
+  clearTimeout(room.timer);
+  for (const p of room.peers.values()) p.res.end('closed\n');
+  room.peers.clear();
+  rooms.delete(room.id);
+}
+
+function roomBroadcast(room, line, except, only) {
+  for (const [id, p] of room.peers) {
+    if (id === except || (only && id !== only)) continue;
+    p.res.write(line);
+  }
+}
+
 // ---------------------------------------------------------------- http helpers
 const SECURITY_HEADERS = {
   'Content-Security-Policy': [
@@ -216,6 +248,53 @@ async function handle(req, res) {
       if (!body.live && need > MAX_STORE_BYTES - storedBytes) return fail(res, 507, 'Not enough free memory on the host — use live streaming');
       const s = createShare(ttl, body.burn, body.live);
       return send(res, 201, { id: s.id, ownerToken: s.ownerToken });
+    }
+
+    if (p === '/api/r' && m === 'POST') {
+      const room = createRoom();
+      return send(res, 201, { id: room.id });
+    }
+
+    const rm = p.match(/^\/api\/r\/([A-Za-z0-9_-]{22})\/(events|send)$/);
+    if (rm) {
+      const room = rooms.get(rm[1]);
+      if (!room) return fail(res, 404, 'This session has ended');
+
+      // Long-lived stream of relay events for one connected device.
+      if (rm[2] === 'events' && m === 'GET') {
+        if (room.peers.size >= ROOM_MAX_PEERS) return fail(res, 429, 'Too many devices in this session');
+        clearTimeout(room.timer);
+        const peerId = newId(6);
+        const token = newId(18);
+        res.writeHead(200, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain; charset=utf-8', 'X-Accel-Buffering': 'no' });
+        res.write(`hi ${peerId} ${token} ${[...room.peers.keys()].join(',') || '-'}\n`);
+        roomBroadcast(room, `join ${peerId}\n`);
+        room.peers.set(peerId, { res, token });
+        const beat = setInterval(() => res.write(':\n'), 15000);
+        res.on('close', () => {
+          clearInterval(beat);
+          if (room.peers.get(peerId)?.res !== res) return;
+          room.peers.delete(peerId);
+          roomBroadcast(room, `leave ${peerId}\n`);
+          if (!room.peers.size && rooms.has(room.id)) room.timer = setTimeout(() => closeRoom(room), ROOM_EMPTY_MS);
+        });
+        return;
+      }
+
+      // Relay one sealed message to every other device (or a single one with ?to=).
+      if (rm[2] === 'send' && m === 'POST') {
+        const from = req.headers['x-peer'];
+        const peer = room.peers.get(from);
+        const token = req.headers['x-peer-token'];
+        if (!peer || typeof token !== 'string' || token.length !== peer.token.length ||
+            !crypto.timingSafeEqual(Buffer.from(token), Buffer.from(peer.token))) return fail(res, 403, 'Forbidden');
+        const body = (await readBody(req, ROOM_MAX_MSG)).toString();
+        if (!/^[A-Za-z0-9_-]+$/.test(body)) return fail(res, 400, 'Bad message');
+        const to = url.searchParams.get('to');
+        roomBroadcast(room, `msg ${from} ${body}\n`, from, to);
+        return send(res, 200, { ok: true });
+      }
+      return fail(res, 405, 'Method not allowed');
     }
 
     const sm = p.match(/^\/api\/s\/([A-Za-z0-9_-]{22})(?:\/(c|m|a|w)(?:\/(\d{1,12}))?)?$/);
@@ -349,7 +428,7 @@ async function handle(req, res) {
       return f ? serveFile(res, f) : fail(res, 404, 'Not found');
     }
     // Receiver links look like /r/<id>#<key>; they load the same single-page app.
-    if (p === '/' || /^\/r\/[A-Za-z0-9_-]{22}$/.test(p)) return serveFile(res, path.join(PUBLIC_DIR, 'index.html'));
+    if (p === '/' || /^\/[rp]\/[A-Za-z0-9_-]{22}$/.test(p)) return serveFile(res, path.join(PUBLIC_DIR, 'index.html'));
     const file = path.normalize(path.join(PUBLIC_DIR, p));
     if (!file.startsWith(PUBLIC_DIR + path.sep)) return fail(res, 404, 'Not found');
     return serveFile(res, file);
@@ -375,6 +454,7 @@ server.listen(PORT, HOST, () => {
 });
 
 function shutdown() {
+  for (const r of [...rooms.values()]) closeRoom(r);
   for (const s of [...shares.values()]) destroyShare(s);
   process.exit(0);
 }

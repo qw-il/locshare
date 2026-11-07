@@ -63,6 +63,8 @@
     return res;
   }
 
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
   async function pool(count, limit, worker) {
     let next = 0;
     const run = async () => { while (next < count) { const i = next++; await worker(i); } };
@@ -254,10 +256,17 @@
   }
 
   const ICON = {
+    copy: '<svg viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="3"/><path d="M16 8V6a2 2 0 00-2-2H6a2 2 0 00-2 2v8a2 2 0 002 2h2"/></svg>',
     x: '<svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>',
     dl: '<svg viewBox="0 0 24 24"><path d="M12 4v11m0 0l-4.5-4.5M12 15l4.5-4.5"/><path d="M5 19h14"/></svg>',
     ok: '<svg viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>',
     spin: '<svg viewBox="0 0 24 24"><path d="M12 3a9 9 0 109 9"><animateTransform attributeName="transform" type="rotate" from="0 12 12" to="360 12 12" dur="0.8s" repeatCount="indefinite"/></path></svg>',
+  };
+
+  const DEVICE_ICON = {
+    phone: '<svg viewBox="0 0 24 24"><rect x="7" y="2.5" width="10" height="19" rx="2.5"/><path d="M11 18.5h2"/></svg>',
+    tablet: '<svg viewBox="0 0 24 24"><rect x="4.5" y="2.5" width="15" height="19" rx="2.5"/><path d="M11 18.5h2"/></svg>',
+    desktop: '<svg viewBox="0 0 24 24"><rect x="2.5" y="4" width="19" height="12.5" rx="2"/><path d="M8 20.5h8M12 16.5v4"/></svg>',
   };
 
   // ============================================================ view switching
@@ -363,18 +372,25 @@
   fileInput.addEventListener('change', () => { addFiles(fileInput.files); fileInput.value = ''; });
   drop.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileInput.click(); } });
   let dragDepth = 0;
-  window.addEventListener('dragenter', (e) => { if (currentView?.id !== 'view-send') return; e.preventDefault(); dragDepth++; drop.classList.add('over'); });
-  window.addEventListener('dragleave', () => { if (--dragDepth <= 0) { dragDepth = 0; drop.classList.remove('over'); } });
+  const dropTarget = () => (currentView?.id === 'view-room' ? $('#roomView') : drop);
+  window.addEventListener('dragenter', (e) => {
+    if (!['view-send', 'view-room'].includes(currentView?.id)) return;
+    e.preventDefault(); dragDepth++; dropTarget().classList.add('over');
+  });
+  window.addEventListener('dragleave', () => { if (--dragDepth <= 0) { dragDepth = 0; drop.classList.remove('over'); $('#roomView').classList.remove('over'); } });
   window.addEventListener('dragover', (e) => e.preventDefault());
   window.addEventListener('drop', (e) => {
     e.preventDefault();
     dragDepth = 0;
     drop.classList.remove('over');
+    $('#roomView').classList.remove('over');
+    if (currentView?.id === 'view-room' && e.dataTransfer?.files.length) return sendRoomFiles(e.dataTransfer.files);
     if (currentView?.id !== 'view-send' || !e.dataTransfer?.files.length) return;
     if (state.mode !== 'files') $('[data-mode="files"]').click();
     addFiles(e.dataTransfer.files);
   });
   window.addEventListener('paste', (e) => {
+    if (currentView?.id === 'view-room' && e.clipboardData?.files.length) { e.preventDefault(); return sendRoomFiles(e.clipboardData.files); }
     if (currentView?.id !== 'view-send' || !e.clipboardData?.files.length) return;
     e.preventDefault();
     if (state.mode !== 'files') $('[data-mode="files"]').click();
@@ -464,8 +480,10 @@
     }
   });
 
-  async function createShare(files, note, onProgress) {
+  async function createShare(files, note, onProgress, opts = {}) {
     await infoReady;
+    const ttl = opts.ttl ?? state.ttl;
+    const burn = opts.burn ?? state.burn;
     const key = nacl.randomBytes(32);
     const prefix = nacl.randomBytes(16);
     const entries = [];
@@ -478,12 +496,12 @@
     const bytes = chunks * (CHUNK + 40);
 
     // No size limit: if the host can't hold the share in RAM, stream it live from this tab instead.
-    const fresh = await api('/api/info').then((r) => r.json()).catch(() => info);
-    let live = bytes > fresh.freeBytes;
+    const fresh = opts.live ? info : await api('/api/info').then((r) => r.json()).catch(() => info);
+    let live = !!opts.live || bytes > fresh.freeBytes;
     const open = (asLive) => api('/api/s', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ttl: state.ttl, burn: state.burn, bytes, live: asLive }),
+      body: JSON.stringify({ ttl, burn, bytes, live: asLive }),
     });
     let res;
     try { res = await open(live); } catch (err) {
@@ -530,7 +548,7 @@
 
       const manifest = sealManifest({
         v: 1, prefix: b64u.enc(prefix), chunkSize: CHUNK, chunks, total, files: entries,
-        note: note || undefined, burn: state.burn, created: Date.now(),
+        note: note || undefined, burn, created: Date.now(),
       }, key);
       const sealed = await (await api(`/api/s/${id}/m`, { method: 'PUT', headers: { ...auth, 'X-Chunk-Count': String(chunks) }, body: manifest })).json();
       onProgress(1);
@@ -538,8 +556,11 @@
       const label = files.length
         ? (files.length === 1 ? files[0].name : `${files[0].name} + ${files.length - 1} more`)
         : 'Private note';
-      const share = { id, ownerToken, key: b64u.enc(key), label, expiresAt: sealed.expiresAt, ttlMs: state.ttl * 60e3, burn: state.burn, opens: 0, downloads: 0, gone: false, live, senderOnline: false };
-      if (live) runLive(share, sealChunk);
+      const share = { id, ownerToken, key: b64u.enc(key), label, expiresAt: sealed.expiresAt, ttlMs: ttl * 60e3, burn, opens: 0, downloads: 0, gone: false, live, senderOnline: false, chunks, served: 0 };
+      if (live) {
+        // Don't hand out the link until this tab is ready to answer block requests.
+        await Promise.race([new Promise((r) => { share.onReady = r; runLive(share, sealChunk); }), sleep(8000)]);
+      }
       return share;
     } catch (err) {
       api(`/api/s/${id}`, { method: 'DELETE', headers: auth }).catch(() => {});
@@ -559,6 +580,7 @@
         active++;
         sealChunk(i)
           .then((body) => fetch(`/api/s/${share.id}/c/${i}?r=${reqId}`, { method: 'PUT', headers: auth, body, cache: 'no-store', signal: share.abort.signal }))
+          .then((r) => { if (r.ok) { share.served++; share.onServe?.(); } })
           .catch(() => {})
           .finally(() => { active--; pump(); });
       }
@@ -578,7 +600,7 @@
           while ((nl = buf.indexOf('\n')) >= 0) {
             const line = buf.slice(0, nl);
             buf = buf.slice(nl + 1);
-            if (line === 'ready') share.senderOnline = true;
+            if (line === 'ready') { share.senderOnline = true; share.onReady?.(); }
             const m = line.match(/^need (\S+) (\d+)$/);
             if (m) { queue.push([m[1], +m[2]]); pump(); }
           }
@@ -774,7 +796,149 @@
     }
   }
 
-  // ============================================================ RECEIVE
+  // ============================================================ share reader
+  // Shared by the one-off receive page and live sessions: decrypts a share's files on demand.
+
+  async function fetchManifest(id, key) {
+    const bytes = new Uint8Array(await (await api(`/api/s/${id}/m`)).arrayBuffer());
+    return openManifest(bytes, key);
+  }
+
+  function makeReader(id, key, manifest) {
+    const prefix = b64u.dec(manifest.prefix);
+    const C = manifest.chunkSize;
+    const files = manifest.files;
+    const total = files.reduce((s, f) => s + f.size, 0);
+    const kept = new Map(); // idx -> { blob, crc }: decrypted copies held in memory
+
+    async function getChunk(i) {
+      for (let attempt = 0; ; attempt++) {
+        try {
+          const buf = new Uint8Array(await (await api(`/api/s/${id}/c/${i}`)).arrayBuffer());
+          // Always use the nonce *we* expect for this index — blocks can't be swapped or reordered.
+          const plain = nacl.secretbox.open(buf.subarray(NONCE), chunkNonce(prefix, i), key);
+          if (!plain) throw Object.assign(new Error('Integrity check failed — data was tampered with'), { fatal: true });
+          return plain;
+        } catch (err) {
+          // A live sender can blip (tab reconnecting, phone busy): retry briefly before giving up.
+          if (err.fatal || err.status === 404 || err.status === 410 || attempt >= 4) throw err;
+          await sleep(700 * (attempt + 1));
+        }
+      }
+    }
+
+    // Decrypt one file block by block, in order, with a few blocks fetched ahead.
+    // Each piece is handed to `write` and can be dropped right after — memory use stays flat.
+    async function streamFile(idx, write, onProgress, wantCrc) {
+      const f = files[idx];
+      if (kept.has(idx)) { const k = kept.get(idx); await write(k.blob); onProgress?.(1); return k.crc; }
+      if (f.size === 0) { onProgress?.(1); return 0; }
+      const first = Math.floor(f.offset / C);
+      const n = Math.floor((f.offset + f.size - 1) / C) - first + 1;
+      const AHEAD = 4;
+      const inflight = new Map();
+      const start = (k) => { const pr = getChunk(first + k); pr.catch(() => {}); inflight.set(k, pr); };
+      for (let k = 0; k < Math.min(AHEAD, n); k++) start(k);
+      let crc = 0;
+      for (let k = 0; k < n; k++) {
+        const plain = await inflight.get(k);
+        inflight.delete(k);
+        if (k + AHEAD < n) start(k + AHEAD);
+        const i = first + k;
+        const part = plain.subarray(Math.max(f.offset, i * C) - i * C, Math.min(f.offset + f.size, (i + 1) * C) - i * C);
+        if (wantCrc) crc = crc32(part, crc);
+        await write(part);
+        onProgress?.((k + 1) / n);
+      }
+      return crc;
+    }
+
+    // Decrypt into memory (for previews and instant saves).
+    async function keep(idx, onProgress) {
+      if (kept.has(idx)) { onProgress?.(1); return kept.get(idx); }
+      const parts = [];
+      const crc = await streamFile(idx, (d) => { parts.push(d); }, onProgress, true);
+      const r = { blob: new Blob(parts, { type: files[idx].type || 'application/octet-stream' }), crc };
+      kept.set(idx, r);
+      return r;
+    }
+
+    // NB: must be called straight from a click handler — the save dialog needs the user gesture.
+    async function saveFile(idx, onProgress) {
+      const f = files[idx];
+      if (kept.has(idx)) { saveBlob(kept.get(idx).blob, f.name); onProgress?.(1); return; }
+      const sink = await openSink(f.name, f.type);
+      try { await streamFile(idx, (d) => sink.write(d), onProgress); await sink.close(); } catch (e) { sink.abort(); throw e; }
+    }
+
+    async function saveAll(onProgress) {
+      if (files.length === 1) return saveFile(0, (p) => onProgress?.(p, 0, p));
+      const sink = await openSink(`locshare-${new Date().toISOString().slice(0, 10)}.zip`, 'application/zip');
+      try {
+        const zip = zipWriter(sink);
+        let doneBytes = 0;
+        for (let idx = 0; idx < files.length; idx++) {
+          const f = files[idx];
+          await zip.add(f.name, f.size, (write) => streamFile(idx, write, (p) => onProgress?.(total ? (doneBytes + p * f.size) / total : 1, idx, p), true));
+          doneBytes += f.size;
+        }
+        await zip.finish();
+      } catch (e) { sink.abort(); throw e; }
+    }
+
+    return { id, manifest, files, total, kept, keep, saveFile, saveAll, ack: () => api(`/api/s/${id}/a`, { method: 'POST' }).catch(() => {}) };
+  }
+
+  // One file row with a progress bar and a save button.
+  function fileRow(reader, idx, opts = {}) {
+    const f = reader.files[idx];
+    const bar = h('div', { class: 'fbar' }, h('i'));
+    bar.style.display = 'none';
+    const icon = fileIcon(f.name, f.type);
+    const btn = opts.button === false ? null : h('button', { class: 'dl-btn', title: 'Save', 'aria-label': `Save ${f.name}`, html: ICON.dl });
+    const li = h('li', { class: 'file', style: `--i:${idx}` },
+      icon,
+      h('div', { class: 'fmeta' }, h('div', { class: 'fname', title: f.name }, f.name), h('div', { class: 'fsize' }, fmtBytes(f.size)), bar),
+      btn);
+    const progress = (p) => { bar.style.display = ''; bar.style.setProperty('--p', p); };
+    const thumb = () => {
+      if (kindOf(f.name, f.type).k === 'img' && f.size <= 6e6 && !/svg/.test(f.type)) {
+        reader.keep(idx).then(({ blob }) => setThumb(icon, URL.createObjectURL(blob))).catch(() => {});
+      }
+    };
+    if (btn) {
+      btn.addEventListener('click', async () => {
+        if (btn.disabled) return;
+        btn.disabled = true;
+        try {
+          const pending = reader.saveFile(idx, progress); // opens the save dialog synchronously
+          btn.innerHTML = ICON.spin;
+          await pending;
+          reader.ack();
+          btn.classList.add('done');
+          btn.innerHTML = ICON.ok;
+        } catch (err) {
+          if (err.name !== 'AbortError') toast(err.message, 'err');
+          btn.innerHTML = ICON.dl;
+        } finally { btn.disabled = false; }
+      });
+    }
+    if (opts.preview !== false) thumb();
+    return { li, progress, icon, btn, thumb };
+  }
+
+  async function copyText(text, el) {
+    try { await navigator.clipboard.writeText(text); } catch {
+      // navigator.clipboard is unavailable on plain-http LAN origins; fall back to a selection copy.
+      const r = document.createRange();
+      r.selectNodeContents(el);
+      getSelection().removeAllRanges(); getSelection().addRange(r);
+      document.execCommand('copy');
+      getSelection().removeAllRanges();
+    }
+  }
+
+  // ============================================================ RECEIVE (one-off link)
   async function receive(id) {
     show('recv');
     const lock = $('#lockAnim');
@@ -807,17 +971,15 @@
     let manifest;
     try {
       if (typeof nacl === 'undefined') throw new Error('Encryption library failed to load');
-      const bytes = new Uint8Array(await (await api(`/api/s/${id}/m`)).arrayBuffer());
-      manifest = openManifest(bytes, key);
+      manifest = await fetchManifest(id, key);
     } catch (err) {
       forget();
       return failWith('Nothing here', err.status === 404 ? 'This share has expired, been revoked, or already self-destructed.' : err.message);
     }
     if (!manifest) return failWith('Wrong key', 'The link’s key doesn’t match this share. Nothing could be decrypted.');
 
-    const prefix = b64u.dec(manifest.prefix);
-    const C = manifest.chunkSize;
-    await new Promise((r) => setTimeout(r, 450)); // let the unlock animation breathe
+    const reader = makeReader(id, key, manifest);
+    await sleep(450); // let the unlock animation breathe
     lock.className = 'lock open';
 
     const fileCount = manifest.files.length;
@@ -829,108 +991,17 @@
     if (manifest.note) {
       $('#noteText').textContent = manifest.note;
       $('#noteOut').classList.remove('hidden');
-      $('#noteCopy').onclick = async () => {
-        try { await navigator.clipboard.writeText(manifest.note); } catch {
-          const r = document.createRange(); r.selectNodeContents($('#noteText'));
-          getSelection().removeAllRanges(); getSelection().addRange(r); document.execCommand('copy'); getSelection().removeAllRanges();
-        }
-        toast('Note copied', 'ok');
-      };
+      $('#noteCopy').onclick = async () => { await copyText(manifest.note, $('#noteText')); toast('Note copied', 'ok'); };
     }
 
-    async function getChunk(i) {
-      const buf = new Uint8Array(await (await api(`/api/s/${id}/c/${i}`)).arrayBuffer());
-      // Always use the nonce *we* expect for this index — blocks can't be swapped or reordered.
-      const plain = nacl.secretbox.open(buf.subarray(NONCE), chunkNonce(prefix, i), key);
-      if (!plain) throw new Error('Integrity check failed — data was tampered with');
-      return plain;
-    }
-
-    // Decrypt one file block by block, in order, with a few blocks fetched ahead.
-    // Each piece is handed to `write` and can be dropped right after — memory use stays flat.
-    async function streamFile(idx, write, onProgress, wantCrc) {
-      const f = manifest.files[idx];
-      if (previews.has(idx)) { const p = previews.get(idx); await write(p.blob); onProgress?.(1); return p.crc; }
-      if (f.size === 0) { onProgress?.(1); return 0; }
-      const first = Math.floor(f.offset / C);
-      const n = Math.floor((f.offset + f.size - 1) / C) - first + 1;
-      const AHEAD = 4;
-      const inflight = new Map();
-      const start = (k) => { const pr = getChunk(first + k); pr.catch(() => {}); inflight.set(k, pr); };
-      for (let k = 0; k < Math.min(AHEAD, n); k++) start(k);
-      let crc = 0;
-      for (let k = 0; k < n; k++) {
-        const plain = await inflight.get(k);
-        inflight.delete(k);
-        if (k + AHEAD < n) start(k + AHEAD);
-        const i = first + k;
-        const part = plain.subarray(Math.max(f.offset, i * C) - i * C, Math.min(f.offset + f.size, (i + 1) * C) - i * C);
-        if (wantCrc) crc = crc32(part, crc);
-        await write(part);
-        onProgress?.((k + 1) / n);
-      }
-      return crc;
-    }
-
-    const previews = new Map(); // idx -> { blob, crc } for small images shown inline
-
-    const ack = () => api(`/api/s/${id}/a`, { method: 'POST' }).catch(() => {});
-
-    // file list
-    const list = $('#recvList');
-    const rows = manifest.files.map((f, idx) => {
-      const bar = h('i');
-      const btn = manifest.burn ? null : h('button', { class: 'dl-btn', title: 'Save', 'aria-label': `Save ${f.name}`, html: ICON.dl });
-      const icon = fileIcon(f.name, f.type);
-      const li = h('li', { class: 'file', style: `--i:${idx}` },
-        icon,
-        h('div', { class: 'fmeta' },
-          h('div', { class: 'fname', title: f.name }, f.name),
-          h('div', { class: 'fsize' }, fmtBytes(f.size)),
-          h('div', { class: 'fbar' }, bar)),
-        btn);
-      bar.parentElement.style.display = 'none';
-      if (btn) {
-        btn.addEventListener('click', async () => {
-          if (btn.disabled) return;
-          btn.disabled = true;
-          let sink;
-          try {
-            sink = await openSink(f.name, f.type);
-            btn.innerHTML = ICON.spin;
-            bar.parentElement.style.display = '';
-            await streamFile(idx, (d) => sink.write(d), (p) => bar.parentElement.style.setProperty('--p', p));
-            await sink.close();
-            ack();
-            btn.classList.add('done');
-            btn.innerHTML = ICON.ok;
-          } catch (err) {
-            sink?.abort();
-            if (err.name !== 'AbortError') toast(err.message, 'err');
-            btn.innerHTML = ICON.dl;
-          } finally { btn.disabled = false; }
-        });
-      }
-      list.append(li);
-      return { li, bar, icon };
+    // Self-destructing shares get no per-file buttons or previews: one save, then gone.
+    const rows = manifest.files.map((_, idx) => {
+      const row = fileRow(reader, idx, { button: !manifest.burn, preview: !manifest.burn });
+      $('#recvList').append(row.li);
+      return row;
     });
 
-    // Small images get a locally-decrypted preview (skipped for self-destructing shares).
-    if (!manifest.burn) {
-      manifest.files.forEach((f, idx) => {
-        if (kindOf(f.name, f.type).k === 'img' && f.size <= 6e6 && !/svg/.test(f.type)) {
-          const parts = [];
-          streamFile(idx, (d) => parts.push(d), null, true).then((crc) => {
-            const blob = new Blob(parts, { type: f.type });
-            previews.set(idx, { blob, crc });
-            setThumb(rows[idx].icon, URL.createObjectURL(blob));
-          }).catch(() => {});
-        }
-      });
-    }
-
-    const total = manifest.files.reduce((s, f) => s + f.size, 0);
-    $('#recvMeta').textContent = `${fileCount ? `${fmtBytes(total)} · ` : ''}verified & decrypted on this device`;
+    $('#recvMeta').textContent = `${fileCount ? `${fmtBytes(reader.total)} · ` : ''}verified & decrypted on this device`;
 
     // Note-only self-destructing share: burn right away, the note is already on screen.
     if (manifest.burn && !fileCount) {
@@ -947,48 +1018,25 @@
         ? (fileCount > 1 ? 'Decrypt & save all (.zip)' : 'Decrypt & save')
         : 'Save all as .zip';
       saveAll.onclick = async () => {
-        if (saveAll.classList.contains('busy')) return;
-        const single = fileCount === 1;
-        let sink;
+        if (saveAll.classList.contains('busy') || saveAll.disabled) return;
         try {
-          sink = await openSink(single ? manifest.files[0].name : `locshare-${new Date().toISOString().slice(0, 10)}.zip`,
-            single ? manifest.files[0].type : 'application/zip');
+          const pending = reader.saveAll((frac, idx, p) => {
+            rows[idx].progress(p);
+            setProgress(saveAll, frac, `Decrypting · ${Math.round(frac * 100)}%`);
+          });
           saveAll.classList.add('busy');
-          let doneBytes = 0;
-          const each = async (idx, write, wantCrc) => {
-            const f = manifest.files[idx];
-            rows[idx].bar.parentElement.style.display = '';
-            const crc = await streamFile(idx, write, (p) => {
-              rows[idx].bar.parentElement.style.setProperty('--p', p);
-              const frac = total ? (doneBytes + p * f.size) / total : 1;
-              setProgress(saveAll, frac, `Decrypting · ${Math.round(frac * 100)}%`);
-            }, wantCrc);
-            doneBytes += f.size;
-            return crc;
-          };
-          if (single) {
-            await each(0, (d) => sink.write(d), false);
-            await sink.close();
-          } else {
-            const zip = zipWriter(sink);
-            for (let idx = 0; idx < fileCount; idx++) {
-              await zip.add(manifest.files[idx].name, manifest.files[idx].size, (write) => each(idx, write, true));
-            }
-            await zip.finish();
-          }
+          await pending;
           setProgress(saveAll, 1, 'Saved');
-          if (!manifest.burn) ack();
           toast(`Saved ${fileCount > 1 ? `${fileCount} files` : manifest.files[0].name}`, 'ok');
           if (manifest.burn) {
             await api(`/api/s/${id}`, { method: 'DELETE' }).catch(() => {});
             forget();
-            previews.clear();
+            reader.kept.clear();
             sub.textContent = 'Saved. The share has self-destructed and was wiped from the host.';
             saveAll.disabled = true;
             setProgress(saveAll, 1, 'Destroyed ✓');
-          }
+          } else reader.ack();
         } catch (err) {
-          sink?.abort();
           if (err.name === 'AbortError') return;
           toast(err.message, 'err');
           setProgress(saveAll, 0, 'Try again');
@@ -999,8 +1047,369 @@
     }
   }
 
+  // ============================================================ LIVE SESSION (paired devices)
+  // Devices that open the same session link form a tiny encrypted room. Messages (device names,
+  // texts, file offers) are sealed with the room key; files travel as live shares that the other
+  // side starts pulling the moment they're offered — no upload step, no size limit.
+  const AUTO_RECEIVE = 256 * 1024 * 1024; // smaller batches are decrypted automatically on arrival
+  const room = { id: null, key: null, me: null, token: null, peers: new Map(), shares: [], abort: null, closed: true, inviteOpen: false };
+
+  function deviceInfo() {
+    const ua = navigator.userAgent;
+    const os = /iPhone/.test(ua) ? 'iPhone' : /iPad/.test(ua) ? 'iPad'
+      : /Android/.test(ua) ? (/Mobile/.test(ua) ? 'Android phone' : 'Android tablet')
+      : /CrOS/.test(ua) ? 'Chromebook' : /Mac/.test(ua) ? (navigator.maxTouchPoints > 1 ? 'iPad' : 'Mac')
+      : /Windows/.test(ua) ? 'Windows PC' : /Linux/.test(ua) ? 'Linux' : 'Device';
+    const br = /Edg\//.test(ua) ? 'Edge' : /Firefox\//.test(ua) ? 'Firefox' : /Chrome\//.test(ua) ? 'Chrome' : /Safari\//.test(ua) ? 'Safari' : '';
+    const kind = /iPhone|Android phone/.test(os) ? 'phone' : /iPad|tablet/.test(os) ? 'tablet' : 'desktop';
+    return { name: br ? `${os} · ${br}` : os, kind };
+  }
+  const myDevice = deviceInfo();
+  const hueOf = (id) => [...id].reduce((a, c) => (a * 31 + c.charCodeAt(0)) % 360, 17);
+  const rid = () => b64u.enc(nacl.randomBytes(9));
+  const roomLink = () => `${shareOrigins()[originIdx]?.origin || location.origin}/p/${room.id}#${b64u.enc(room.key)}`;
+
+  function sealMsg(obj) {
+    const json = new TextEncoder().encode(JSON.stringify(obj));
+    const padded = new Uint8Array(Math.ceil((json.length + 4) / 256) * 256); // blur message lengths
+    new DataView(padded.buffer).setUint32(0, json.length);
+    padded.set(json, 4);
+    return b64u.enc(seal(padded, nacl.randomBytes(NONCE), room.key));
+  }
+  function openMsg(str) {
+    try { return openManifest(b64u.dec(str), room.key); } catch { return null; }
+  }
+
+  async function roomSend(obj, to) {
+    if (!room.me) throw new Error('Not connected yet — reconnecting…');
+    await api(`/api/r/${room.id}/send${to ? `?to=${to}` : ''}`, {
+      method: 'POST',
+      headers: { 'X-Peer': room.me, 'X-Peer-Token': room.token, 'Content-Type': 'text/plain' },
+      body: sealMsg(obj),
+    });
+  }
+
+  async function readLines(res, onLine) {
+    const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+    let buf = '';
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) return;
+      buf += value;
+      let nl;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl);
+        buf = buf.slice(nl + 1);
+        if (line && line[0] !== ':') onLine(line);
+      }
+    }
+  }
+
+  async function startRoom() {
+    if (typeof nacl === 'undefined') return toast('Encryption library failed to load', 'err');
+    try {
+      await infoReady;
+      const { id } = await (await api('/api/r', { method: 'POST' })).json();
+      enterRoom(id, nacl.randomBytes(32));
+    } catch (err) { toast(err.message, 'err'); }
+  }
+
+  async function enterRoom(id, key) {
+    Object.assign(room, { id, key, me: null, token: null, closed: false, inviteOpen: false });
+    room.peers.clear();
+    $('#feed').textContent = '';
+    // Keep the key in tab memory only and scrub it from the address bar / history.
+    try { sessionStorage.setItem(`p:${id}`, b64u.enc(key)); } catch { /* private mode */ }
+    history.replaceState(null, '', `/p/${id}`);
+    show('room');
+    renderInvite();
+    renderRoom();
+    room.abort = new AbortController();
+    let failures = 0;
+    while (!room.closed && room.id === id) {
+      try {
+        const res = await fetch(`/api/r/${id}/events`, { cache: 'no-store', signal: room.abort.signal });
+        if (res.status === 404) return endRoom('This session has ended.');
+        if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || 'Connection failed');
+        failures = 0;
+        await readLines(res, onRoomLine);
+      } catch (err) {
+        if (room.closed) return;
+        if (++failures === 3) toast(err.message || 'Connection lost — retrying', 'err');
+      }
+      room.me = null;
+      room.peers.clear();
+      renderRoom();
+      if (!room.closed) await sleep(1200);
+    }
+  }
+
+  function onRoomLine(line) {
+    const [cmd, a, b] = line.split(' ');
+    if (cmd === 'hi') {
+      room.me = a;
+      room.token = b;
+      renderRoom();
+      roomSend({ t: 'hello', ...myDevice }).catch(() => {});
+    } else if (cmd === 'join') {
+      roomSend({ t: 'hello', ...myDevice }, a).catch(() => {});
+    } else if (cmd === 'leave') {
+      const p = room.peers.get(a);
+      if (p) { room.peers.delete(a); toast(`${p.name} disconnected`); renderRoom(); }
+    } else if (cmd === 'msg') {
+      const msg = openMsg(b);
+      if (msg) onRoomMsg(a, msg); // anything that doesn't decrypt with the room key is ignored
+    } else if (cmd === 'closed') {
+      endRoom('This session has ended.');
+    }
+  }
+
+  function onRoomMsg(from, msg) {
+    if (msg.t === 'hello') {
+      const isNew = !room.peers.has(from);
+      room.peers.set(from, { name: String(msg.name || 'Device').slice(0, 60), kind: msg.kind });
+      if (isNew) {
+        toast(`${room.peers.get(from).name} connected`, 'ok');
+        room.inviteOpen = false;
+        renderRoom();
+      }
+      return;
+    }
+    const peer = room.peers.get(from);
+    if (!peer) return;
+    if (msg.t === 'text') addTextItem(String(msg.body || '').slice(0, 100000), from);
+    else if (msg.t === 'files') receiveRoomFiles(from, msg);
+    else if (msg.t === 'got') {
+      const el = $(`[data-item="${CSS.escape(msg.id)}"]`);
+      if (el) { el.classList.add('delivered'); $('.msg-foot', el).textContent = `Delivered to ${peer.name} ✓`; }
+    } else if (msg.t === 'bye') {
+      room.peers.delete(from);
+      toast(`${peer.name} left`);
+      renderRoom();
+    }
+  }
+
+  function renderInvite() {
+    const link = roomLink();
+    $('#roomLink').value = link;
+    drawQR($('#roomQr'), link);
+  }
+
+  function renderRoom() {
+    const n = room.peers.size;
+    const status = $('#roomStatus');
+    status.classList.toggle('on', !!room.me && n > 0);
+    status.classList.toggle('off', !room.me);
+    $('span:last-child', status).textContent = !room.me
+      ? 'Connecting…'
+      : n ? `${n + 1} devices connected · encrypted` : 'Waiting for another device to join…';
+    $('#roomInvite').classList.toggle('collapsed', n > 0 && !room.inviteOpen);
+    $('#roomView').classList.toggle('paired', n > 0);
+
+    const wrap = $('#peers');
+    const want = [['me', { name: `${myDevice.name} (this device)`, kind: myDevice.kind }], ...room.peers];
+    const have = new Map($$('.peer', wrap).map((el) => [el.dataset.peer, el]));
+    for (const [id, el] of have) {
+      if (id !== 'me' && !room.peers.has(id) && !el.classList.contains('out')) {
+        el.classList.add('out');
+        el.addEventListener('animationend', () => el.remove(), { once: true });
+      }
+    }
+    for (const [id, p] of want) {
+      if (have.has(id)) continue;
+      wrap.append(h('span', { class: `peer${id === 'me' ? ' me' : ''}`, 'data-peer': id, style: `--h:${id === 'me' ? 265 : hueOf(id)}` },
+        h('span', { class: 'peer-ico', html: DEVICE_ICON[p.kind] || DEVICE_ICON.desktop }), p.name));
+    }
+    updateSendState();
+  }
+
+  function endRoom(why) {
+    if (room.closed) return;
+    room.closed = true;
+    room.abort?.abort();
+    for (const s of room.shares) if (!s.gone) {
+      api(`/api/s/${s.id}`, { method: 'DELETE', headers: { 'X-Owner-Token': s.ownerToken } }).catch(() => {});
+      markGone(s, 'Session ended');
+    }
+    room.shares = [];
+    try { sessionStorage.removeItem(`p:${room.id}`); } catch { /* ignore */ }
+    history.replaceState(null, '', '/');
+    if (why) toast(why);
+    show('send');
+    refreshSummary();
+  }
+
+  async function leaveRoom() {
+    if (room.me) await roomSend({ t: 'bye' }).catch(() => {});
+    endRoom();
+  }
+
+  // ---- feed
+  const timeStr = () => new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+  function feedItem(from, id) {
+    const mine = from === 'me';
+    const name = mine ? 'You' : room.peers.get(from)?.name || 'Device';
+    const li = h('li', { class: `msg ${mine ? 'mine' : 'theirs'}`, 'data-item': id, style: `--h:${mine ? 265 : hueOf(from)}` },
+      h('div', { class: 'msg-head' }, h('span', { class: 'msg-dot' }), h('b', {}, name), h('span', {}, timeStr())));
+    const feed = $('#feed');
+    feed.append(li);
+    requestAnimationFrame(() => feed.scrollTo({ top: feed.scrollHeight, behavior: 'smooth' }));
+    return li;
+  }
+
+  function addTextItem(text, from, id = rid()) {
+    const li = feedItem(from, id);
+    const pre = h('pre', { class: 'msg-text' }, text);
+    li.append(pre, h('button', { class: 'msg-copy', title: 'Copy', html: ICON.copy, onclick: async () => { await copyText(text, pre); toast('Copied', 'ok'); } }));
+    return li;
+  }
+
+  async function sendRoomText() {
+    const ta = $('#roomText');
+    const text = ta.value;
+    if (!text.trim()) return;
+    if (!room.peers.size) return toast('No device connected yet — scan the QR code on another device first');
+    const id = rid();
+    try {
+      await roomSend({ t: 'text', id, body: text });
+      ta.value = '';
+      autosize();
+      addTextItem(text, 'me', id);
+    } catch (err) { toast(err.message, 'err'); }
+  }
+
+  async function sendRoomFiles(list) {
+    const files = [...list];
+    if (!files.length) return;
+    if (!room.peers.size) return toast('No device connected yet — scan the QR code on another device first');
+    const id = rid();
+    const li = feedItem('me', id);
+    const total = files.reduce((s, f) => s + f.size, 0);
+    const ul = h('ul', { class: 'files' }, files.map((f, i) => h('li', { class: 'file', style: `--i:${i}` },
+      fileIcon(f.name, f.type, kindOf(f.name, f.type).k === 'img' && f.size < 25e6 ? URL.createObjectURL(f) : null),
+      h('div', { class: 'fmeta' }, h('div', { class: 'fname', title: f.name }, f.name), h('div', { class: 'fsize' }, fmtBytes(f.size))))));
+    const bar = h('div', { class: 'fbar big' }, h('i'));
+    const foot = h('div', { class: 'msg-foot' }, 'Encrypting…');
+    li.append(ul, bar, foot);
+    try {
+      const share = await createShare(files, '', () => {}, { live: true, ttl: 1440, burn: false });
+      room.shares.push(share);
+      share.onServe = () => {
+        const p = share.chunks ? Math.min(1, share.served / share.chunks) : 1;
+        bar.style.setProperty('--p', p);
+        if (!li.classList.contains('delivered')) foot.textContent = p < 1 ? `Sending · ${Math.round(p * 100)}%` : 'Sent — waiting for confirmation…';
+      };
+      await roomSend({ t: 'files', id, share: share.id, key: share.key, files: files.map((f) => ({ name: f.name, size: f.size, type: f.type })) });
+      foot.textContent = total ? 'Sending · 0%' : 'Sent';
+      if (!share.chunks) bar.style.setProperty('--p', 1);
+    } catch (err) {
+      foot.textContent = `Failed: ${err.message}`;
+      li.classList.add('failed');
+    }
+  }
+
+  async function receiveRoomFiles(from, msg) {
+    const li = feedItem(from, msg.id);
+    const foot = h('div', { class: 'msg-foot' }, 'Unlocking…');
+    const ul = h('ul', { class: 'files' });
+    li.append(ul, foot);
+    let reader;
+    try {
+      const key = b64u.dec(String(msg.key));
+      const manifest = await fetchManifest(String(msg.share), key);
+      if (!manifest) throw new Error('Could not decrypt this transfer');
+      reader = makeReader(String(msg.share), key, manifest);
+    } catch (err) {
+      foot.textContent = `Failed: ${err.message}`;
+      li.classList.add('failed');
+      return;
+    }
+    const rows = reader.files.map((_, idx) => { const r = fileRow(reader, idx, { preview: false }); ul.append(r.li); return r; });
+    const n = reader.files.length;
+    if (n > 1) {
+      const btn = h('button', { class: 'ghost small' }, `Save all ${n} (.zip)`);
+      btn.addEventListener('click', async () => {
+        try {
+          const pending = reader.saveAll((frac, idx, p) => rows[idx].progress(p));
+          btn.disabled = true;
+          btn.textContent = 'Saving…';
+          await pending;
+          reader.ack();
+          btn.textContent = 'Saved ✓';
+        } catch (err) {
+          if (err.name !== 'AbortError') toast(err.message, 'err');
+          btn.textContent = `Save all ${n} (.zip)`;
+        } finally { btn.disabled = false; }
+      });
+      li.append(btn);
+    }
+
+    if (reader.total > AUTO_RECEIVE) {
+      foot.textContent = `${fmtBytes(reader.total)} — tap save to stream it straight to disk`;
+      roomSend({ t: 'got', id: msg.id }, from).catch(() => {});
+      return;
+    }
+    // Small enough: pull and decrypt right away so it's ready the instant it lands.
+    try {
+      let done = 0;
+      for (let idx = 0; idx < n; idx++) {
+        const size = reader.files[idx].size;
+        await reader.keep(idx, (p) => {
+          rows[idx].progress(p);
+          foot.textContent = `Receiving · ${Math.round(((done + p * size) / (reader.total || 1)) * 100)}%`;
+        });
+        done += size;
+        rows[idx].progress(1);
+        rows[idx].thumb();
+      }
+      foot.textContent = `Received ${fmtBytes(reader.total)} · decrypted on this device`;
+      li.classList.add('delivered');
+      roomSend({ t: 'got', id: msg.id }, from).catch(() => {});
+      if ($('#autoSave').checked) {
+        reader.files.forEach((f, idx) => saveBlob(reader.kept.get(idx).blob, f.name));
+        reader.ack();
+      }
+    } catch (err) {
+      foot.textContent = `Failed: ${err.message}`;
+      li.classList.add('failed');
+    }
+  }
+
+  // ---- composer
+  const roomText = $('#roomText');
+  function autosize() { roomText.style.height = 'auto'; roomText.style.height = `${Math.min(roomText.scrollHeight, 160)}px`; }
+  function updateSendState() { $('#roomSendBtn').disabled = !roomText.value.trim(); }
+  roomText.addEventListener('input', () => { autosize(); updateSendState(); });
+  roomText.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendRoomText().then(updateSendState); }
+  });
+  $('#roomSendBtn').addEventListener('click', () => sendRoomText().then(updateSendState));
+  $('#roomAttach').addEventListener('click', () => $('#roomFiles').click());
+  $('#roomFiles').addEventListener('change', (e) => { sendRoomFiles(e.target.files); e.target.value = ''; });
+  $('#roomInviteBtn').addEventListener('click', () => { room.inviteOpen = !room.inviteOpen; renderRoom(); });
+  $('#roomLeaveBtn').addEventListener('click', leaveRoom);
+  $('#roomCopy').addEventListener('click', async () => { await copyText($('#roomLink').value, $('#roomLink')); toast('Session link copied — it contains the key', 'ok'); });
+  $('#pairBtn').addEventListener('click', startRoom);
+  try { $('#autoSave').checked = localStorage.getItem('autoSave') === '1'; } catch { /* ignore */ }
+  $('#autoSave').addEventListener('change', (e) => { try { localStorage.setItem('autoSave', e.target.checked ? '1' : '0'); } catch { /* ignore */ } });
+
+  // Leaving mid-transfer would cut the other device off — warn first.
+  window.addEventListener('beforeunload', (e) => {
+    if (!room.closed && room.shares.some((s) => !s.gone && s.served < s.chunks)) { e.preventDefault(); e.returnValue = ''; }
+  });
+
   // ============================================================ boot
-  const route = location.pathname.match(/^\/r\/([A-Za-z0-9_-]{22})$/);
-  if (route) receive(route[1]);
-  else { show('send'); refreshSummary(); }
+  const route = location.pathname.match(/^\/([rp])\/([A-Za-z0-9_-]{22})$/);
+  if (route?.[1] === 'r') receive(route[2]);
+  else if (route?.[1] === 'p') {
+    let keyStr = location.hash.slice(1);
+    if (!keyStr) { try { keyStr = sessionStorage.getItem(`p:${route[2]}`) || ''; } catch { /* ignore */ } }
+    let key = null;
+    try { key = b64u.dec(keyStr); } catch { /* bad key */ }
+    infoReady.then(() => {
+      if (key?.length === 32 && typeof nacl !== 'undefined') enterRoom(route[2], key);
+      else { history.replaceState(null, '', '/'); show('send'); refreshSummary(); toast('That session link is incomplete — scan the QR code again', 'err'); }
+    });
+  } else { show('send'); refreshSummary(); }
 })();
