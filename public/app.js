@@ -102,37 +102,93 @@
 
   // Walk dropped folders recursively. Entries must be grabbed synchronously inside the drop event.
   function entriesFromDrop(dt) {
-    const entries = [...(dt?.items || [])].filter((i) => i.kind === 'file').map((i) => i.webkitGetAsEntry?.()).filter(Boolean);
+    let entries = [];
+    try { entries = [...(dt?.items || [])].filter((i) => i.kind === 'file').map((i) => i.webkitGetAsEntry?.()).filter(Boolean); } catch { entries = []; }
     return entries.length ? entries : null;
   }
-  async function walkEntries(entries) {
+  // Browsers also list a dropped or pasted *folder* in `.files` as a fake, unreadable file
+  // (0 B on Windows, 4 KB on Linux/macOS). Spot those so a folder is never shared as an empty file.
+  async function isFolderStub(f) {
+    if (f.type) return false;
+    try { await f.slice(0, 1).arrayBuffer(); } catch { return true; }
+    return f.size === 0 && !/\.[^./]+$/.test(f.name);
+  }
+
+  async function walkEntries(entries, onProgress) {
     const items = [];
     const dirs = [];
+    const failed = [];
+    let bytes = 0;
+    let last = 0;
+    const tick = () => {
+      const now = performance.now();
+      if (now - last > 150) { last = now; onProgress?.(items.length, bytes); }
+    };
+    const fileOf = (entry) => new Promise((res, rej) => entry.file(res, rej));
+    const listDir = async (dir) => {
+      const reader = dir.createReader();
+      const kids = [];
+      for (;;) { // readEntries returns at most ~100 entries per call
+        const batch = await new Promise((res, rej) => reader.readEntries(res, rej));
+        if (!batch.length) return kids;
+        kids.push(...batch);
+      }
+    };
     async function walk(entry, prefix) {
       if (entry.isFile) {
-        const file = await new Promise((res, rej) => entry.file(res, rej));
-        items.push({ file, path: prefix + file.name });
-      } else if (entry.isDirectory) {
-        const reader = entry.createReader();
-        const kids = [];
-        for (;;) {
-          const batch = await new Promise((res, rej) => reader.readEntries(res, rej));
-          if (!batch.length) break;
-          kids.push(...batch);
-        }
-        const here = prefix + entry.name;
-        if (!kids.length) dirs.push(here);
-        for (const k of kids) await walk(k, here + '/');
+        // Unreadable files (no permission, online-only cloud placeholders…) are skipped, not fatal.
+        try { const file = await fileOf(entry); items.push({ file, path: prefix + file.name }); bytes += file.size; tick(); }
+        catch { failed.push(prefix + entry.name); }
+        return;
       }
+      if (!entry.isDirectory) return;
+      const here = prefix + entry.name;
+      let kids;
+      try { kids = await listDir(entry); } catch { failed.push(here + '/'); return; }
+      if (!kids.length) { dirs.push(here); return; }
+      const files = kids.filter((k) => k.isFile);
+      for (let i = 0; i < files.length; i += 64) await Promise.all(files.slice(i, i + 64).map((k) => walk(k, here + '/')));
+      for (const k of kids) if (k.isDirectory) await walk(k, here + '/');
     }
     for (const e of entries) await walk(e, '');
-    return { items, dirs };
+    items.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+    onProgress?.(items.length, bytes);
+    return { items, dirs, failed, stubs: [] };
   }
-  async function droppedItems(dt) {
-    const entries = entriesFromDrop(dt);
-    if (!entries) return { items: asItems(dt?.files || []), dirs: [] };
-    return walkEntries(entries);
+
+  // Everything that arrives by drag & drop or paste goes through here.
+  async function droppedItems(dt, onProgress) {
+    const entries = entriesFromDrop(dt); // must run before the first await
+    if (entries) return walkEntries(entries, onProgress);
+    const files = [...(dt?.files || [])];
+    const items = [];
+    const stubs = [];
+    for (const f of files) (await isFolderStub(f) ? stubs : items).push(f);
+    return { items: asItems(items), dirs: [], failed: [], stubs: stubs.map((f) => f.name) };
   }
+
+  // Tell people about anything that couldn't come along.
+  function reportDropIssues({ items, dirs, failed, stubs }, how) {
+    if (stubs.length) {
+      const name = `“${stubs[0]}”${stubs.length > 1 ? ` and ${stubs.length - 1} more` : ''}`;
+      toast(how === 'paste'
+        ? `${name} is a folder — browsers can’t paste folders. Drag it in, or use “choose a folder”.`
+        : `This browser didn’t let LocShare look inside ${name}. Use “choose a folder” instead.`, 'err');
+    }
+    if (failed.length) toast(`Skipped ${failed.length.toLocaleString()} item${failed.length > 1 ? 's' : ''} that couldn’t be read (no permission, or online-only cloud files)`, 'err');
+    return items.length + dirs.length > 0;
+  }
+
+  // A toast that stays up and updates while a big folder is being read.
+  function liveToast() {
+    const t = h('div', { class: 'toast live' }, 'Reading…');
+    $('#toasts').append(t);
+    return {
+      set: (text) => { t.textContent = text; },
+      done: () => { t.classList.add('out'); t.addEventListener('animationend', () => t.remove()); },
+    };
+  }
+  const readingText = (n, bytes) => `Reading folder… ${n.toLocaleString()} file${n === 1 ? '' : 's'} · ${fmtBytes(bytes)}`;
 
   async function pool(count, limit, worker) {
     let next = 0;
@@ -469,27 +525,45 @@
     if (!['view-send', 'view-room'].includes(currentView?.id) || !e.dataTransfer?.files.length) return;
     const inRoom = currentView.id === 'view-room';
     if (!inRoom && state.mode !== 'files') $('[data-mode="files"]').click();
-    // Grab folder entries now (they expire with the event), then walk them.
-    droppedItems(e.dataTransfer).then(({ items, dirs }) => {
-      if (!items.length && !dirs.length) return;
-      if (inRoom) sendRoomFiles(items, dirs);
-      else addFiles(items, dirs);
-    }).catch((err) => toast(`Couldn’t read the dropped folder: ${err.message}`, 'err'));
+    takeIncoming(e.dataTransfer, inRoom, 'drop');
   });
   window.addEventListener('paste', (e) => {
-    if (currentView?.id === 'view-room' && e.clipboardData?.files.length) { e.preventDefault(); return sendRoomFiles(e.clipboardData.files); }
-    if (currentView?.id !== 'view-send' || !e.clipboardData?.files.length) return;
+    if (!['view-send', 'view-room'].includes(currentView?.id) || !e.clipboardData?.files.length) return;
     e.preventDefault();
-    if (state.mode !== 'files') $('[data-mode="files"]').click();
-    addFiles(e.clipboardData.files);
+    const inRoom = currentView.id === 'view-room';
+    if (!inRoom && state.mode !== 'files') $('[data-mode="files"]').click();
+    takeIncoming(e.clipboardData, inRoom, 'paste');
   });
+
+  // Read dropped/pasted things (walking folders), with a live count for big folders.
+  function takeIncoming(dt, inRoom, how) {
+    let tip = null;
+    const timer = setTimeout(() => { tip = liveToast(); }, 400); // only for reads that take a moment
+    if (!inRoom) drop.classList.add('reading');
+    droppedItems(dt, (n, bytes) => {
+      tip?.set(readingText(n, bytes));
+      if (!inRoom) $('#summary').textContent = readingText(n, bytes);
+    }).then((res) => {
+      if (!reportDropIssues(res, how)) return;
+      if (inRoom) sendRoomFiles(res.items, res.dirs);
+      else addFiles(res.items, res.dirs);
+    }).catch((err) => toast(`Couldn’t read that: ${err.message}`, 'err'))
+      .finally(() => {
+        clearTimeout(timer);
+        tip?.done();
+        drop.classList.remove('reading');
+        if (!inRoom) refreshSummary();
+      });
+  }
 
   // state.files holds {file, path} items; state.dirs holds empty folder paths.
   state.dirs = [];
   function addFiles(list, dirs = []) {
     if (state.busy) return;
     const start = fileList.children.length;
-    const fresh = asItems(list).filter((it) => !state.files.some((x) => x.path === it.path && x.file.size === it.file.size && x.file.lastModified === it.file.lastModified));
+    const keyOf = (it) => `${it.path}\u0000${it.file.size}\u0000${it.file.lastModified}`;
+    const seen = new Set(state.files.map(keyOf));
+    const fresh = asItems(list).filter((it) => { const k = keyOf(it); if (seen.has(k)) return false; seen.add(k); return true; });
     for (const d of dirs) if (!state.dirs.includes(d)) state.dirs.push(d);
     state.files.push(...fresh);
     let n = 0;
@@ -646,7 +720,11 @@
       const start = i * CHUNK;
       const end = Math.min(start + CHUNK, total);
       const parts = [];
-      for (let k = 0; k < files.length; k++) {
+      // Binary-search the first file overlapping this chunk (folders can hold 100k+ files).
+      let lo = 0;
+      let hi = entries.length;
+      while (lo < hi) { const mid = (lo + hi) >> 1; if (entries[mid].offset + entries[mid].size <= start) lo = mid + 1; else hi = mid; }
+      for (let k = lo; k < entries.length && entries[k].offset < end; k++) {
         const e = entries[k];
         const a = Math.max(start, e.offset);
         const b = Math.min(end, e.offset + e.size);
@@ -927,6 +1005,9 @@
 
   // Writing real folders needs the File System Access API (Chromium on HTTPS or localhost).
   const canSaveFolders = typeof window.showDirectoryPicker === 'function';
+  // Beyond this, saving without streaming to disk relies on the browser buffering everything.
+  const HUGE = 4 * 1024 ** 3;
+  const hugeWarning = (bytes) => `This is ${fmtBytes(bytes)}. To save something this big reliably, open LocShare over HTTPS (npm run https) in Chrome or Edge — it then streams straight to disk.`;
 
   // ============================================================ save location
   // Where received files go. Where the browser allows it, the person picks a folder once; it's
@@ -1302,11 +1383,13 @@
         }
       });
       const done = new Map();
+      let sum = 0;
       const progress = (idx, p) => {
-        done.set(idx, p * reader.files[idx].size);
-        const sum = [...done.values()].reduce((a, b) => a + b, 0);
+        const now = p * reader.files[idx].size;
+        sum += now - (done.get(idx) || 0);
+        done.set(idx, now);
         bar.style.display = '';
-        bar.style.setProperty('--p', g.size ? sum / g.size : 1);
+        bar.style.setProperty('--p', g.size ? Math.min(1, sum / g.size) : 1);
       };
       g.idx.forEach((idx) => folderRows[idx] = progress);
       if (btn) {
@@ -1420,6 +1503,7 @@
 
     $('#recvMeta').textContent = `${fileCount ? `${fmtBytes(reader.total)} · ` : ''}verified & decrypted on this device`;
     $('#recvSaveLoc').classList.toggle('hidden', !fileCount);
+    if (reader.total > HUGE && !canSaveFolders) toast(hugeWarning(reader.total), 'err');
 
     // Note-only self-destructing share: burn right away, the note is already on screen.
     if (manifest.burn && !fileCount) {
@@ -1781,7 +1865,9 @@
     }
 
     if (reader.total > AUTO_RECEIVE) {
-      foot.textContent = `${fmtBytes(reader.total)} — tap save to stream it straight to disk`;
+      foot.textContent = canSaveFolders || saveDest.handle
+        ? `${fmtBytes(reader.total)} — tap save to stream it straight to disk`
+        : reader.total > HUGE ? hugeWarning(reader.total) : `${fmtBytes(reader.total)} — tap save to download`;
       roomSend({ t: 'got', id: msg.id }, from).catch(() => {});
       return;
     }

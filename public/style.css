@@ -554,6 +554,10 @@ li.folder.open > .files.sub { display: flex; animation: paneIn 0.45s var(--smoot
 .sl-help code { font-family: var(--mono); color: #ddd6fe; background: rgba(167, 139, 250, 0.12); padding: 1px 5px; border-radius: 5px; }
 @media (max-width: 520px) { .sl-help { padding-left: 4px; } }
 
+.drop.reading .drop-icon { animation: float 1s ease-in-out infinite; }
+.drop.reading .drop-ring { opacity: 1; animation-duration: 1.2s; }
+.toast.live::before { animation: ping 1.2s var(--smooth) infinite; }
+
 /* ================================================================ dialog / toasts */
 .sheet {
   width: min(480px, 100% - 32px); padding: 26px; border-radius: var(--radius); color: var(--text);
